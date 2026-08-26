@@ -181,4 +181,10 @@ check.
 - Backward-compatible features require a minor increment; fixes require a
   patch increment.
 
-No release tag is created by this repository conversion.
+Release tags are created only after validation and explicit publication.
+
+## Contributors
+
+- [Xuxu Wei](https://github.com/xuxu-wei) — creator and maintainer.
+- OpenAI Codex — repository standardization, progressive-disclosure design,
+  CLI hardening, tests, and release assistance.
