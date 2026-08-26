@@ -12,7 +12,8 @@ Source: https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f
 - Raw sources are preserved.
 - The wiki is the interpreted, cross-linked layer.
 - A schema or agent contract tells future agents how to operate.
-- Ingest, query, lint, and health diagnosis are separate operations.
+- Ingest, query, and lint are the core operations in the original pattern.
+- This skill adds a separate read-only health and source-drift diagnosis.
 - Navigation files matter: `index.md` helps find knowledge; `log.md` explains
   what changed and when.
 
@@ -29,20 +30,27 @@ contradictions, and no source material rewritten as interpretation changes.
    `raw/derived/` linked back to preserved originals.
 2. Wiki pages: source summaries, entities, concepts, syntheses, comparisons,
    and filed queries.
-3. Contract: the selected root agent config (`CLAUDE.md`, `AGENTS.md`, or
-   another Markdown file), `README.md`, `index.md`, `log.md`, and `_meta/`
-   files that keep the system navigable.
+3. Contract and navigation: the selected root agent config (`AGENTS.md` by
+   default), generated `index.md`, append-only `log.md`, and `_meta/` files.
+   `README.md` is the human-facing map rather than mandatory task context.
 
-## Three Operations
+## Core Operations and Skill Extension
 
 - Ingest: classify sources, summarize, update durable pages, update navigation,
   and log the action.
-- Query: orient, read relevant pages, answer from compiled knowledge, and file
-  durable syntheses when useful.
-- Lint: detect structural decay, metadata gaps, broken links, source drift,
-  orphan pages, stale pages, and unclassified inbox items.
-- Health: decide whether source drift requires a knowledge update and identify
-  affected source summaries and dependent pages.
+- Query: retrieve relevant pages, answer from compiled knowledge, and file only
+  durable syntheses worth reusing. Read-only answers do not require a log entry.
+- Lint: review contradictions, stale claims, orphan pages, missing concepts or
+  cross-references, and data gaps. The agent leads this semantic review while
+  the CLI supplies structural checks.
+- Health (this skill's extension): decide whether source drift requires a
+  knowledge update, then identify affected source summaries and dependent
+  pages.
+
+Karpathy's source is an abstract idea file rather than a software
+specification. This skill's fixed directory layout, frontmatter rules, source
+summaries, hashes, health/fix commands, safe-path checks, and packaging are
+opinionated implementation choices.
 
 ## Agent Discipline
 

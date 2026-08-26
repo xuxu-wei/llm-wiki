@@ -3,9 +3,9 @@
 The LLM Wiki is plain Markdown and does not require Obsidian. Use Obsidian
 features only when they improve the user's requested workflow.
 
-## Required Related Skill
+## Optional Markdown Assistance
 
-`obsidian-markdown` is the only hard skill dependency. Use it for:
+If an Obsidian-specific Markdown skill is available, use it for:
 
 - wikilinks;
 - embeds;
@@ -14,16 +14,19 @@ features only when they improve the user's requested workflow.
 - Obsidian tag syntax;
 - note formatting that must render cleanly in Obsidian.
 
-## Optional Skills
+If it is unavailable, follow this skill's plain Markdown, frontmatter, and
+wikilink rules. Do not block the core workflow on another skill.
 
-- `defuddle`: use for cleaning normal web pages into Markdown before saving
-  source text into `raw/articles/`. Do not require it; use available extraction
+## Optional Integrations
+
+- A web-page cleanup tool: use it before saving source text into
+  `raw/articles/`. Do not require it; use available extraction
   tools when it is absent.
-- `json-canvas`: use for optional concept maps, research evidence maps, or
+- A JSON Canvas tool: use it for optional concept maps, research evidence maps, or
   workflow diagrams stored as `.canvas`.
-- `obsidian-bases`: use for optional dashboards over source metadata, status,
+- An Obsidian Bases tool: use it for optional dashboards over source metadata, status,
   confidence, tags, and update dates.
-- `obsidian-cli`: use only when the user wants operations against a running
+- An Obsidian CLI integration: use it only when the user wants operations against a running
   Obsidian vault.
 
 ## Vault Settings

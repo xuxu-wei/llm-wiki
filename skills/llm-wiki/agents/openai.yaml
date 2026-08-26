@@ -1,0 +1,4 @@
+interface:
+  display_name: "LLM Wiki"
+  short_description: "Build and maintain source-grounded Markdown wikis"
+  default_prompt: "Use $llm-wiki to build or maintain a source-grounded Markdown wiki."
