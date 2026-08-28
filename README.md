@@ -1,190 +1,88 @@
-# LLM Wiki Codex Skill
+# LLM Wiki Codex 技能
 
-`llm-wiki` is an OpenAI-compatible Codex skill for building and maintaining a
-source-grounded Markdown knowledge base. It preserves raw sources, maintains
-linked wiki pages and navigation, and includes a standard-library Python CLI
-for bounded retrieval, staged ingest, indexing, linting, source-drift diagnosis,
-safe metadata normalization, and archival.
+`llm-wiki` 是一个用于构建和维护来源可追溯、由 Git 管理的 Markdown wiki 的 Codex 技能。Obsidian 是默认的人类交互界面；公开状态始终由普通 Markdown、CSV、二进制来源文件和 Git 历史组成。
 
-The installable skill is [`skills/llm-wiki`](skills/llm-wiki). Repository
-documentation, tests, and CI remain outside that directory so Codex installs
-only runtime content.
+唯一可安装的技能目录是 [`skills/llm-wiki`](skills/llm-wiki)。测试、CI、设计文档和仓库指南位于该目录之外。
 
-## Inspiration and Design Alignment
+## 工作模型
 
-This independent project is inspired by Andrej Karpathy's
-[`LLM Wiki` idea file](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f),
-which describes a persistent, compounding Markdown wiki maintained by an LLM
-between a user and immutable raw sources. It is not affiliated with, endorsed
-by, or maintained by Andrej Karpathy.
+- Markdown 页面是语义事实源。
+- Git 是强制依赖，负责检查点、差异、历史和恢复。
+- PDF、XLSX、图片和其他来源文件直接由 `raw/` 下的普通 Git 跟踪。
+- `raw/` 保存原始证据文件，`sources/` 用来源卡片描述证据及其限制，`notes/` 保存可复用的综合内容，`inbox/` 接收尚未整理的人类思考，`assets/` 服务于页面展示。
+- `index.csv` 是根据页面 frontmatter 确定性生成、可重建的视图。
+- Python 负责可重复的文件、索引、检索、审计和 Git 操作。
+- LLM 负责解释来源、撰写语义元数据、组织知识、判断证据和综合内容。
 
-The skill follows the original pattern at the architecture and workflow level:
+本设计受 Andrej Karpathy 的 [`LLM Wiki` 构想](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)启发。本仓库是独立且有明确设计取向的实现，与 Andrej Karpathy 无从属关系，也不由其维护。
 
-- Raw sources remain the source of truth while the agent maintains a durable,
-  cross-linked knowledge layer.
-- A local agent contract such as `AGENTS.md` or `CLAUDE.md` defines the schema
-  and operating rules.
-- Ingest, query, and lint workflows keep knowledge cumulative; `index.md`
-  supports navigation and `log.md` records an append-only history.
-- The human curates sources, directs inquiry, and reviews judgment calls while
-  the agent handles synthesis, cross-linking, and maintenance.
-- Plain Markdown is the foundation; Obsidian, search engines, and other tools
-  remain optional.
-
-Karpathy's document intentionally leaves directory layout, schema, page
-formats, and tooling to each user and agent. This repository is an opinionated,
-Codex-first implementation that adds its own directory and frontmatter
-defaults, source summaries, provenance and drift checks, structural linting,
-Python CLI, safety rules, tests, and install/update workflow. These are project
-extensions, not parts of an official Karpathy specification or implementation.
-
-Two boundaries are worth making explicit:
-
-- `hash-source --write` is retained only as a deprecated compatibility flag and
-  is refused for files under `raw/`. Record the reported hash on the matching
-  `sources/` page or in generated machine state instead.
-- The CLI lint focuses on structure, links, metadata, provenance, and drift.
-  Semantic review for contradictions, stale claims, missing concepts, and new
-  research questions remains an agent-led task.
-
-## Progressive Disclosure
-
-The skill keeps its always-loaded instructions deliberately small. `SKILL.md`
-contains task routing and safety invariants; Create, Ingest, Query, and Maintain
-each have one short first-level reference. Schema semantics live only in the
-wiki contract, while templates contain file shapes without repeating workflow
-rules. A normal query therefore loads the skill, the Query reference, the local
-agent contract, and bounded CLI context—not the full contract, README, index,
-log, ingest rules, or research guidance.
-
-This division is intentional: templates are the formatting source of truth,
-references are the workflow and semantic source of truth, and the CLI enforces
-deterministic checks. It reduces routine context cost without weakening raw
-immutability, provenance, path containment, prompt-injection resistance, or
-high-impact stop conditions.
-
-The current measured rule budgets are below; unit tests lock their ceilings.
-English word counts include `SKILL.md` and the selected operation references,
-but exclude on-demand templates, the local wiki contract, and bounded runtime
-results:
-
-| Route | Skill files loaded | Rule words |
-| --- | ---: | ---: |
-| Query | 2 | 1,117 |
-| Ingest | 2 | 1,190 |
-| Research ingest | 3 | 1,574 |
-| Maintain | 2 | 1,143 |
-
-The generated base `AGENTS.md` is 213 words, and `context` defaults to at most
-3,200 characters (roughly 800 English tokens). This keeps the normal Query
-path near the planned 2–2.5k-token fixed-context envelope while allowing
-targeted expansion when provenance or drift requires it.
-
-The bundled source template is named `templates/wiki-agent-contract.md` to
-avoid confusing it with an active Codex instruction file. During wiki
-initialization, the CLI renders that template as `<wiki>/AGENTS.md` by default,
-or as `CLAUDE.md` only when Claude compatibility is explicitly selected.
-
-## Install with Codex
-
-Ask Codex:
+## Wiki 仓库结构
 
 ```text
-Use $skill-installer to install https://github.com/xuxu-wei/llm-wiki/tree/main/skills/llm-wiki
+<vault>/
+├── AGENTS.md
+├── <home>.md
+├── index.csv
+├── inbox/
+├── raw/
+├── sources/
+├── notes/
+├── assets/
+├── .gitattributes
+└── .gitignore
 ```
 
-The skill installer places the package at
-`$CODEX_HOME/skills/llm-wiki` (normally `~/.codex/skills/llm-wiki`). The newly
-installed skill is available on the next Codex turn.
+页面名称可以使用中文或任何其他 Unicode 语言。可见文件名就是 Obsidian 节点名称，不需要额外的 ASCII slug。
 
-`main` is the latest development release. For a reproducible installation,
-replace `main` with a SemVer tag after one is published:
+## 运行环境
+
+依赖：
+
+- Git
+- Python 3.10 或更高版本
+- 仅使用 Python 标准库
+
+确定已安装技能的目录后运行：
 
 ```text
-Use $skill-installer to install https://github.com/xuxu-wei/llm-wiki/tree/vMAJOR.MINOR.PATCH/skills/llm-wiki
+python <skill-dir>/scripts/wiki.py --help
+python <skill-dir>/scripts/wiki.py <command> --help
 ```
 
-## Update Safely
+公开命令包括 `init`、`begin`、`add`、`context`、`audit` 和 `save`。命令面向智能体输出 JSON。查询和审计操作只读；`audit --scope all` 执行完整健康检查，`audit --scope changed` 聚焦变更范围；一个完整的写入工作流以通过审计的 Git 检查点结束。
 
-The standard skill installer intentionally refuses to overwrite an existing
-destination. Ask Codex to use a staged replacement instead of deleting the
-installed skill first:
+## 使用 Codex 安装
+
+向 Codex 发出以下请求：
 
 ```text
-Use $skill-installer to update llm-wiki from https://github.com/xuxu-wei/llm-wiki/tree/main/skills/llm-wiki. Install the candidate into a unique staging directory under $CODEX_HOME/.skill-staging, validate it, back up the current skill under $CODEX_HOME/.skill-backups, replace the installed directory, and restore the backup if any post-install check fails. Keep staging and backups outside $CODEX_HOME/skills.
+使用 $skill-installer 安装 https://github.com/xuxu-wei/llm-wiki/tree/main/skills/llm-wiki
 ```
 
-The update procedure is:
+安装器会把软件包放到 `$CODEX_HOME/skills/llm-wiki`，通常是 `~/.codex/skills/llm-wiki`。该技能从下一轮 Codex 交互开始可用。
 
-1. Install the candidate with the skill installer's `--dest` option into
-   `$CODEX_HOME/.skill-staging/<unique-id>/llm-wiki`.
-2. Run OpenAI's `quick_validate.py` against the candidate and run
-   `python <candidate>/scripts/wiki_tools.py --help`.
-3. Move the current `$CODEX_HOME/skills/llm-wiki` to
-   `$CODEX_HOME/.skill-backups/llm-wiki-<timestamp>`.
-4. Move the validated candidate into `$CODEX_HOME/skills/llm-wiki` on the same
-   filesystem. Once the old directory has moved to backup, restore it after any
-   replacement or validation failure; never leave the installed path missing
-   or partially replaced.
-5. Repeat validation at the installed path and restore the backup immediately
-   if validation fails.
-6. Confirm the new skill on the next Codex turn, then remove stale staging and
-   backup directories when rollback is no longer needed.
+## 安全更新
 
-Never place a backup inside `$CODEX_HOME/skills`; Codex could discover it as a
-second skill. To pin an update, use a tag URL instead of `main`.
+标准安装器不会覆盖已有目标目录。更新时，应先安装到 `$CODEX_HOME/.skill-staging` 下的唯一目录并完成验证，再把当前安装移动到 `$CODEX_HOME/.skill-backups`，最后替换正式安装。如果替换或安装后验证失败，则恢复备份。不要把暂存副本或备份副本放在 `$CODEX_HOME/skills` 下，否则 Codex 可能把它们识别为重复技能。
 
-## Runtime
-
-- Python 3.10 or newer
-- Python standard library only
-- Plain Markdown; Obsidian integrations are optional
-- Codex creates `AGENTS.md` by default; explicit Claude compatibility remains
-  available through `--agent-platform claude`
-
-The default profile targets a personal, medium-sized wiki. SQLite FTS,
-persistent cross-process locks or crash journals, source-version/multi-artifact
-models, and partitioned thousand-page indexes are optional scale extensions,
-not hidden runtime dependencies. Add them only as explicit, versioned schema
-decisions; Markdown must remain the source of truth and any search database must
-be rebuildable.
-
-Resolve the installed skill directory and run:
+验证暂存副本和已安装副本：
 
 ```text
-python <skill-dir>/scripts/wiki_tools.py --help
+python -X utf8 <skill-creator-dir>/scripts/quick_validate.py <candidate>/llm-wiki
+python <candidate>/llm-wiki/scripts/wiki.py --help
 ```
 
-## Develop and Validate
-
-Run the repository tests:
+## 开发与验证
 
 ```text
+python -X utf8 <skill-creator-dir>/scripts/quick_validate.py skills/llm-wiki
 python -m unittest discover -s tests -v
+python skills/llm-wiki/scripts/wiki.py --help
 ```
 
-Validate the installable directory with the current OpenAI skill validator:
+CI 会在 Windows、Ubuntu 和 macOS 上使用 Python 3.10 与 3.13 运行测试套件。
 
-```text
-python <skill-creator-dir>/scripts/quick_validate.py skills/llm-wiki
-```
+## 贡献者
 
-CI runs the tests on Python 3.10 and 3.13 across Windows, Ubuntu, and macOS,
-then fetches the current validator from `openai/skills` for a separate package
-check.
-
-## Versioning
-
-- `main`: latest version
-- `vMAJOR.MINOR.PATCH`: immutable, reproducible release reference
-- Breaking CLI or wiki-contract changes require a major version increment.
-- Backward-compatible features require a minor increment; fixes require a
-  patch increment.
-
-Release tags are created only after validation and explicit publication.
-
-## Contributors
-
-- [Xuxu Wei](https://github.com/xuxu-wei) — creator and maintainer.
-- OpenAI Codex — repository standardization, progressive-disclosure design,
-  CLI hardening, tests, and release assistance.
+- [Xuxu Wei](https://github.com/xuxu-wei) — 创建者与维护者。
+- OpenAI Codex — 技能架构、运行时、测试与验证。

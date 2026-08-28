@@ -24,9 +24,14 @@ jobs:
       - name: Run unit and smoke tests
         run: python -m unittest discover -s tests -v
       - name: Check CLI entrypoint
-        run: python skills/llm-wiki/scripts/wiki_tools.py --help
-      - name: Confirm tests did not rewrite tracked files
-        run: git diff --exit-code
+        run: python skills/llm-wiki/scripts/wiki.py --help
+      - name: Confirm tests did not change repository state
+        shell: bash
+        run: |
+          git diff --exit-code
+          status="$(git status --porcelain=v1 --untracked-files=all)"
+          printf '%s\n' "$status"
+          test -z "$status"
 
   openai-validator:
     name: OpenAI skill validator

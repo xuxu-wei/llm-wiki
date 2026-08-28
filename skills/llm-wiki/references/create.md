@@ -1,55 +1,33 @@
-# Create
+# 创建 wiki
 
-Use this procedure to initialize a new wiki or deliberately migrate an existing
-one. Read the wiki contract immediately after this file; it is the authority for
-directory layout, profiles, metadata, and lifecycle behavior.
+本流程用于创建新的 vault。已有的无关仓库不能作为初始化目标。
 
-## Prepare
+## 初始化
 
-Resolve the target from the user's explicit path, then `WIKI_PATH`, then a
-clearly named local directory. Infer the domain from the request and ask only
-when it would materially change the taxonomy or research profile. Inspect an
-existing target before initialization. Do not replace an existing agent file,
-append-only log, or unrelated project instructions.
+1. 解析用户指定的目标，并在写入前检查它。
+2. 确认 Git 和 Python 3.10+ 可用。
+3. 选择易读的 Unicode 首页名称，并编写面向检索的首页 summary。优先使用用户搜索时会使用的语言。
+4. 从任意目录运行：
 
-Use the installed skill directory, not the current working directory:
+   ```text
+   python "<skill-dir>/scripts/wiki.py" init "<vault>" --name "<home-name>" --home-summary "<summary>"
+   ```
 
-```bash
-python "<skill-dir>/scripts/wiki_tools.py" init <wiki-path> --domain "<domain>"
-```
+5. 检查 JSON 结果以及初始 Git 差异或检查点。
 
-The default platform is Codex and the default contract is `AGENTS.md`. Use
-`--agent-platform claude` only for explicit Claude compatibility, or
-`--agent-file <root-markdown-name>` for a user-selected compatible agent file.
-Use `--research` only when the wiki will manage scientific literature or other
-research evidence. Initialization may refresh generated `README.md` and
-`index.md` with `--force`, but it must never overwrite an existing agent config
-or `log.md`.
+初始化必须创建独立的 Git worktree，其中包含 `AGENTS.md`、首页 MOC、`index.csv`、`inbox/`、`raw/`、`sources/`、`notes/`、`assets/`、`.gitattributes` 和 `.gitignore`。遇到冲突时应保留已有用户文件和 Git 配置，不得强制完成初始化。
 
-## Establish the contract
+初始化会创建 `AGENTS.md`；如果已有智能体合同与之冲突，应拒绝继续，不得静默替换或改写。
 
-Keep the generated `AGENTS.md` short and operational. Put the human description
-in `README.md`; agents do not need to read that file on every task. Customize
-the domain and a small tag taxonomy without duplicating the full schema. Use
-`_meta/` for any larger controlled vocabulary or administrative note.
+## 验证
 
-Do not add a new page type, raw category, required field, database, embedding
-index, Obsidian dependency, or external runtime during ordinary initialization.
-Treat each of those as a schema decision and obtain approval when it changes the
-published contract.
+运行 `begin`，然后执行完整的只读 `audit`。确认：
 
-## Verify
+- vault 根目录就是 Git worktree 根目录；
+- 初始检查点干净且可恢复；
+- 首页是有效的 `moc`，并出现在 `index.csv` 中；
+- `raw/**` 不进行文本转换；
+- `.obsidian/` 被忽略，而 wiki 内容仍由 Git 跟踪；
+- vault 可以在 Obsidian 或其他编辑器中作为普通 Markdown 打开。
 
-Run bounded structural checks before the first ingest:
-
-```bash
-python "<skill-dir>/scripts/wiki_tools.py" lint <wiki-path> --summary --limit 20
-python "<skill-dir>/scripts/wiki_tools.py" health <wiki-path> --summary --limit 20 --no-inventory
-```
-
-Confirm that the agent file, root navigation files, raw categories, durable-page
-directories, `_meta/schema.json`, and `_archive/` exist. Confirm schema version
-2 and the selected `core` or `research` profile. Report the domain, platform,
-profile, created files, preserved files, and warnings. Stop rather than
-partially migrating an existing wiki when its current layout or metadata cannot
-be reconciled safely with the contract.
+报告 vault 路径、首页、检查点，以及任何被保留或发生冲突的文件。

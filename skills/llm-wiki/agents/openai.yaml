@@ -1,4 +1,4 @@
 interface:
-  display_name: "LLM Wiki"
-  short_description: "Build and maintain source-grounded Markdown wikis"
-  default_prompt: "Use $llm-wiki to build or maintain a source-grounded Markdown wiki."
+  display_name: "LLM Wiki 知识库"
+  short_description: "创建和维护由 Git 管理、兼容 Obsidian 的知识库"
+  default_prompt: "使用 $llm-wiki 创建或维护一个有来源依据且兼容 Obsidian 的知识库。"

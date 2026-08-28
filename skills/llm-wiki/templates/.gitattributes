@@ -1,0 +1,4 @@
+* text=auto
+*.md text eol=lf
+index.csv text eol=lf
+raw/** -text -diff

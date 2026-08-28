@@ -1,39 +1,33 @@
-# Repository Agent Guide
+# 仓库智能体指南
 
-This repository publishes the `llm-wiki` Codex skill. Treat
-`skills/llm-wiki/` as the only installable skill directory.
+本仓库发布 `llm-wiki` Codex 技能。`skills/llm-wiki/` 是唯一可安装的技能目录。
 
-## Repository Contract
+## 仓库合同
 
-- Keep `SKILL.md`, runtime scripts, references, templates, and
-  `agents/openai.yaml` under `skills/llm-wiki/`.
-- Keep repository documentation, CI, and tests outside the installable skill.
-- Keep `SKILL.md` frontmatter limited to `name` and `description`.
-- Keep `agents/openai.yaml` synchronized with `SKILL.md`; do not add icons,
-  brand colors, tools, or policy fields unless explicitly requested.
-- Preserve a Python 3.10+ standard-library-only runtime.
-- Make Codex and `AGENTS.md` the defaults. Preserve Claude support only as an
-  explicit compatibility mode.
-- Treat Obsidian and other skills or integrations as optional.
+- 把 `SKILL.md`、运行时脚本、references、templates 和 `agents/openai.yaml` 保存在 `skills/llm-wiki/` 下。
+- 把仓库文档、CI、测试和设计规范保存在可安装技能目录之外。
+- `SKILL.md` frontmatter 只能包含 `name` 和 `description`。
+- 保持 `agents/openai.yaml` 与 `SKILL.md` 同步；除非用户明确要求，否则不要增加图标、品牌色、依赖或策略字段。
+- 运行时必须支持 Python 3.10+，且仅使用标准库。
+- 使用 Codex 和 wiki 本地的 `AGENTS.md` 作为受支持的智能体合同。
+- 核心 Markdown/Git 格式不得依赖 Obsidian 或其他可选集成。
 
-## Safety and Compatibility
+## 安全边界
 
-- Never let metadata paths escape the target wiki root.
-- Never overwrite an existing agent config or append-only `log.md` during
-  initialization.
-- Preview bulk wiki normalization with `fix --dry-run`.
-- Preserve existing CLI flags unless a versioned breaking change is intended.
-- Keep install and staged-update instructions in the root README aligned with
-  the behavior of OpenAI's `skill-installer`.
+- Git 是强制依赖，也是检查点边界。
+- 解析后的路径不得逃逸目标 vault。
+- 不得覆盖已有 wiki、智能体合同、页面或 raw 文件。
+- `raw/` 下已提交文件的路径和字节不可变。
+- Markdown frontmatter 是语义事实源；`index.csv` 必须确定性生成，且不得反向导入页面。
+- 读取操作必须保持只读。不得通过隐式 stash、reset、clean 或删除来恢复状态。
 
-## Required Validation
+## 必须执行的验证
 
-Before handing off a change:
+交付变更前：
 
-1. Run OpenAI `quick_validate.py` against `skills/llm-wiki`.
-2. Run `python -m unittest discover -s tests -v`.
-3. Run `python skills/llm-wiki/scripts/wiki_tools.py --help`.
-4. Confirm tests did not modify tracked files or add caches to version control.
+1. 使用 UTF-8 模式对 `skills/llm-wiki` 运行 OpenAI `quick_validate.py`：`python -X utf8 <skill-creator-dir>/scripts/quick_validate.py skills/llm-wiki`。
+2. 运行 `python -m unittest discover -s tests -v`。
+3. 运行 `python skills/llm-wiki/scripts/wiki.py --help`。
+4. 确认测试没有修改已跟踪文件，也没有把未忽略的缓存加入版本控制。
 
-Do not commit, push, create a release, or create a Git tag unless the user
-explicitly requests it.
+除非用户明确要求，否则不得执行 `git commit` 或 `git push`，不得发布版本或创建 Git 标签。

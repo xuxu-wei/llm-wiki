@@ -1,64 +1,44 @@
-# Maintain
+# 维护与保存检查点
 
-Use this procedure for structural audit, source drift, bounded repair,
-normalization, or archival. Start with compact read-only output and expand only
-the affected scope.
+此流程适用于处理人工编辑、元数据漂移、链接修复、索引恢复、MOC 策展、重命名、合并、拆分和其他 wiki 变更。
 
-## Diagnose
+## 从 Git 状态开始
 
-Run structural lint first. Scope by a source path when investigating one ingest
-or drift chain:
+`begin` 是写入工作的起点，不是健康检查或保存命令。写入前运行它，使用其报告的 HEAD 作为操作基线，并区分现有差异：
 
-```bash
-python "<skill-dir>/scripts/wiki_tools.py" lint <wiki-path> --summary --limit 20
-python "<skill-dir>/scripts/wiki_tools.py" health <wiki-path> --summary --limit 20 --no-inventory
-python "<skill-dir>/scripts/wiki_tools.py" health <wiki-path> --source <path> --summary --limit 20
-```
+- 开始新的 LLM 工作前，单独审查并保存人工编辑的检查点。
+- 对尚未完成的 LLM 操作，应继续处理或与用户共同解决。
+- 不触碰无关文件，也不把它们纳入本次操作。
 
-Remove `--summary`, raise `--limit`, or allow the inventory only after the
-compact result identifies a relevant category. Treat containment failures,
-missing raw originals, broken provenance, invalid hashes, duplicate identities,
-and ambiguous source references as blocking. Treat style, field order, page
-length, and optional metadata gaps as warnings unless they conceal provenance.
+不得 stash、reset、clean 或静默合并变更。只读诊断不得修改工作树。
 
-Hash drift means the source bytes changed; it does not prove an interpretation
-is wrong. Review the matching source summary, any derived artifact and its
-derivation-time hash, then dependent durable pages. Mark derived material stale
-when its recorded source hash no longer matches.
+## 审查与审计
 
-## Repair safely
+使用 `audit --scope changed` 聚焦本次变化。使用 Git 差异找出发生语义变化的页面，只重新阅读这些页面及必要的相邻页面：
 
-Preview deterministic normalization:
+- 审查新增、重命名或 `kind` 发生变化页面的元数据。
+- 页面核心含义或范围变化时，更新 summary、aliases、tags 和来源关系。
+- 仅有拼写、格式或机械性链接修复时，不要改写元数据，除非元数据已不准确。
+- 保留未知属性和用户原文。
 
-```bash
-python "<skill-dir>/scripts/wiki_tools.py" fix <wiki-path> --dry-run
-```
+通过语义策展维护 MOC。MOC 是人工导航，不是 `index.csv` 的渲染结果。
 
-Apply only changes shown in the preview. `fix` must skip raw originals and fail
-closed on comments, nested or otherwise unsupported YAML, duplicate fields, or
-any frontmatter it cannot round-trip safely. It may normalize canonical field
-order or mechanically derivable values; it must not invent confidence, status,
-bibliographic facts, interpretations, or conflict resolutions. Re-run the same
-scoped lint and health checks after applying changes. Expect the result to
-converge with no repeated rewrite.
+## 保存
 
-## Archive without deleting
+`save` 是审计后的受控写入，不是健康检查的别名。运行时传入原始基线、操作类型和明确纳入范围的路径。仅当相关 Markdown 发生变化或索引漂移时，运行时才会从页面文件头重建 `index.csv`，按字节比较结果，使用与独立 `audit` 相同的规则审计候选检查点，并让提交只包含纳入范围的路径及生成的索引。缺失的 `index.csv` 可以在此阶段从 Markdown 文件头重建，不应在重建前被结构检查阻断。
 
-Preview archival with a reason and optional replacement:
+审计失败时，保留可见差异并修复报告所指向的文件。不得通过手工修改 CSV 行进行修复，应从 Markdown 重建。无变化的重建不得产生 diff。
 
-```bash
-python "<skill-dir>/scripts/wiki_tools.py" archive <wiki-path> <page> --reason "<reason>" --dry-run
-```
+## 执行风险边界
 
-Review backlinks, index changes, the preserved `_archive/` destination, and
-`replaced_by` before rerunning with `--apply`. Archive must preserve the old
-relative path, record `archived_at` and the reason, update incoming links, and
-append one log entry only after the operation succeeds. Delete only with
-explicit approval.
+常规新增、用户要求的页面更新、无歧义的链接修复、元数据同步和索引重建，可以在审计通过后提交。
 
-Use atomic same-directory replacement and a pre-write content check for every
-managed rewrite. If any input changed since diagnosis, abort and re-run rather
-than overwriting concurrent work. Log successful mutations or an explicitly
-requested audit, not routine read-only diagnostics. Stop before schema changes,
-mass archival, or repairs expected to change more than 10 pages, and present
-the exact scope and recovery path.
+以下操作必须先展示 diff 并取得用户批准：
+
+- 保存此前人工编辑的检查点；
+- 重命名或删除页面；
+- 合并、拆分或大幅改写用户内容；
+- 更改 source/raw 或 source/source 关系；
+- 解决语义冲突。
+
+绝不修改或移动已提交的 raw，不丢弃未经确认的工作，不暂存无关文件，也不允许 Python 编造 summary、tags、aliases、页面边界或证据结论。
