@@ -301,6 +301,19 @@ class SkillPackageAcceptanceTests(unittest.TestCase):
         ignore = (SKILL_DIR / "templates" / ".gitignore").read_text(encoding="utf-8")
         self.assertIn(".obsidian/", ignore)
 
+    def test_ingest_keeps_a_linked_material_bundle_in_one_source(self) -> None:
+        ingest = (SKILL_DIR / "references" / "ingest.md").read_text(encoding="utf-8")
+        for phrase in (
+            "同一资料包",
+            "相对链接",
+            "同一 `source` 的多个 `raw`",
+            "主读材料",
+            "控制性原文",
+            "附件角色",
+            "派生关系另建 `source`",
+        ):
+            self.assertIn(phrase, ingest)
+
     def test_runtime_uses_only_python_standard_library_imports(self) -> None:
         source = SCRIPT_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(SCRIPT_PATH))
