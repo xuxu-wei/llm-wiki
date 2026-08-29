@@ -197,7 +197,7 @@ class SkillPackageAcceptanceTests(unittest.TestCase):
         self.assertEqual(set(metadata), {"name", "description"})
         self.assertEqual(metadata["name"], "llm-wiki")
         description = metadata["description"].lower()
-        for trigger in ("创建", "摄入", "查询", "审计", "维护"):
+        for trigger in ("创建", "摄入", "查询", "标签", "审计", "维护"):
             self.assertIn(trigger, description, f"description must trigger {trigger} tasks")
         self.assertLess(len(skill_text.splitlines()), 500)
 
@@ -231,7 +231,7 @@ class SkillPackageAcceptanceTests(unittest.TestCase):
         skill_text = SKILL_PATH.read_text(encoding="utf-8")
         _metadata, body = frontmatter(skill_text)
         self.assertNotRegex(body, r"(?m)^path,kind,summary,aliases,tags$")
-        self.assertNotRegex(body, r"(?m)^\s*wiki\.py\s+(?:init|begin|add|context|audit|save)\b")
+        self.assertNotRegex(body, r"(?m)^\s*wiki\.py\s+(?:init|begin|add|context|audit|save|tags)\b")
         for route_word in ("创建", "摄入", "查询", "维护", "Obsidian"):
             self.assertIn(route_word, body)
 
@@ -248,7 +248,9 @@ class SkillPackageAcceptanceTests(unittest.TestCase):
         self.assertRegex(body, r"`context`[^\n]*(?:结构化查询)[^\n]*(?:候选|检索)")
         self.assertRegex(body, r"`audit`[^\n]*(?:只读)[^\n]*(?:健康|合同)")
         self.assertRegex(body, r"`save`[^\n]*(?:索引)[^\n]*(?:审计)[^\n]*(?:检查点)")
+        self.assertRegex(body, r"`tags`[^\n]*(?:标签)[^\n]*(?:审阅|用户|手动)")
         self.assertRegex(body, r"审计[^\n]*\[维护\]\(references/maintain\.md\)")
+        self.assertRegex(body, r"标签[^\n]*\[维护\]\(references/maintain\.md\)")
         self.assertIn("精确参数", body)
         for reference in ("create.md", "ingest.md", "query.md", "maintain.md", "contract.md"):
             self.assertIn(f"references/{reference}", body)
@@ -377,6 +379,37 @@ class SkillPackageAcceptanceTests(unittest.TestCase):
                 for argument in arguments:
                     self.assertIn(argument, help_text, f"{command} help must document {argument}")
 
+        tag_help = subprocess.run(
+            (sys.executable, str(SCRIPT_PATH), "tags", "--help"),
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        self.assertEqual(tag_help.returncode, 0, tag_help.stderr)
+        for term in ("tag", "collect", "apply", "review"):
+            self.assertIn(term, tag_help.stdout.lower())
+        tag_subcommands = {
+            "collect": ("--base", "--output"),
+            "apply": ("--base", "--plan", "--approved"),
+        }
+        for subcommand, arguments in tag_subcommands.items():
+            with self.subTest(command=f"tags {subcommand}"):
+                completed = subprocess.run(
+                    (sys.executable, str(SCRIPT_PATH), "tags", subcommand, "--help"),
+                    cwd=REPO_ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                for argument in arguments:
+                    self.assertIn(argument, completed.stdout)
+
         source = SCRIPT_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(SCRIPT_PATH))
         undocumented: list[str] = []
@@ -399,7 +432,11 @@ class SkillPackageAcceptanceTests(unittest.TestCase):
             if isinstance(help_keyword.value, ast.Constant) and not str(help_keyword.value.value).strip():
                 undocumented.append(str(label))
         self.assertEqual(undocumented, [], "every public CLI argument must have non-empty help")
-        self.assertEqual(public_commands, set(expectations), "do not add a separate health command")
+        self.assertEqual(
+            public_commands,
+            {*expectations, "tags", "collect", "apply"},
+            "the public parser surface must match the documented commands",
+        )
 
 
 if __name__ == "__main__":

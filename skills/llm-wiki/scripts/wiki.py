@@ -32,6 +32,8 @@ EXIT_AUDIT = 4
 EXIT_REVIEW = 5
 
 INDEX_HEADER = ("path", "kind", "summary", "aliases", "tags")
+TAG_PLAN_HEADER = ("tag", "page_count", "action", "target")
+SPREADSHEET_FORMULA_PREFIXES = frozenset("=+-@\t\r\n")
 INDEX_DIRS = ("sources", "notes", "inbox")
 VAULT_DIRS = ("inbox", "raw", "sources", "notes", "assets")
 KEEP_FILE = ".gitkeep"
@@ -79,6 +81,7 @@ HIGH_RISK_OPERATIONS = {
     "source-binding",
     "conflict",
     "control",
+    "tag-maintenance",
 }
 GLOBAL_AUDIT_CODES = {
     "E_VAULT_HEAD",
@@ -464,8 +467,13 @@ def read_text(path: Path) -> str:
         raise WikiError(f"Markdown is not valid UTF-8: {path}") from exc
 
 
-def atomic_write(path: Path, data: bytes) -> bool:
+def atomic_write(path: Path, data: bytes, *, expected: bytes | None = None) -> bool:
     current = path.read_bytes() if path.exists() else None
+    if expected is not None and current != expected:
+        raise WikiError(
+            f"Refusing to overwrite a file that changed during the operation: {path}",
+            code=EXIT_CONFLICT,
+        )
     if current == data:
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -473,6 +481,13 @@ def atomic_write(path: Path, data: bytes) -> bool:
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
+        if expected is not None:
+            latest = path.read_bytes() if path.exists() else None
+            if latest != expected:
+                raise WikiError(
+                    f"Refusing to overwrite a file that changed during the operation: {path}",
+                    code=EXIT_CONFLICT,
+                )
         os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):
@@ -485,10 +500,23 @@ def stable_strings(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(sorted(cleaned, key=lambda item: (item.casefold(), item)))
 
 
+def ordered_strings(values: Iterable[str]) -> tuple[str, ...]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = unicodedata.normalize("NFC", value.strip())
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            result.append(cleaned)
+    return tuple(result)
+
+
 def parse_scalar(value: str) -> str | None:
     value = value.strip()
     if not value:
         return ""
+    if has_unquoted_inline_comment(value):
+        raise ValueError("unquoted inline comments are not supported")
     if value.startswith('"'):
         try:
             parsed = json.loads(value)
@@ -512,6 +540,8 @@ def parse_inline_list(value: str) -> list[str]:
         return []
     if not (value.startswith("[") and value.endswith("]")):
         raise ValueError("expected a list")
+    if has_unquoted_inline_comment(value[1:-1]):
+        raise ValueError("unquoted inline comments are not supported in list values")
     if has_unquoted_mapping_marker(value[1:-1]):
         raise ValueError("list values must be strings, not mappings")
     try:
@@ -557,6 +587,35 @@ def has_unquoted_mapping_marker(value: str) -> bool:
             quote = character
             continue
         if character == ":" and (index + 1 == len(value) or value[index + 1].isspace()):
+            return True
+    return False
+
+
+def has_unquoted_inline_comment(value: str) -> bool:
+    quote: str | None = None
+    escaped = False
+    for index, character in enumerate(value):
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if quote == "'":
+            if escaped:
+                escaped = False
+            elif character == quote:
+                if index + 1 < len(value) and value[index + 1] == quote:
+                    escaped = True
+                    continue
+                quote = None
+            continue
+        if character in {'"', "'"}:
+            quote = character
+            continue
+        if character == "#" and (index == 0 or value[index - 1].isspace()):
             return True
     return False
 
@@ -616,11 +675,20 @@ def parse_frontmatter_text(text: str) -> tuple[dict[str, Any], str, list[str]]:
         block_items: list[str] = []
         cursor = index + 1
         while cursor < len(header):
-            item_match = re.match(r"^[ \t]+-[ \t]*(.*)$", header[cursor])
-            if not item_match:
-                break
-            block_items.append(item_match.group(1))
-            cursor += 1
+            continuation = header[cursor]
+            if not continuation.strip() or continuation.lstrip().startswith("#"):
+                cursor += 1
+                continue
+            item_match = re.match(r"^[ \t]+-[ \t]*(.*)$", continuation)
+            if item_match:
+                block_items.append(item_match.group(1))
+                cursor += 1
+                continue
+            if continuation[:1] in {" ", "\t"}:
+                errors.append(f"{key}: unsupported indented continuation")
+                cursor += 1
+                continue
+            break
         try:
             if key in LIST_FIELDS:
                 if block_items:
@@ -628,6 +696,8 @@ def parse_frontmatter_text(text: str) -> tuple[dict[str, Any], str, list[str]]:
                         raise ValueError("cannot mix an inline list with block list items")
                     parsed_items = []
                     for item in block_items:
+                        if has_unquoted_inline_comment(item):
+                            raise ValueError("unquoted inline comments are not supported in list values")
                         if has_unquoted_mapping_marker(item):
                             raise ValueError("list values must be strings, not mappings")
                         parsed = parse_scalar(item)
@@ -1478,13 +1548,22 @@ def replace_frontmatter_list(text: str, field: str, values: Sequence[str]) -> st
         if re.match(rf"^{re.escape(field)}\s*:", lines[index]):
             start = index
             end = index + 1
-            while end < closing and re.match(r"^[ \t]+-[ \t]*", lines[end]):
-                end += 1
+            preserved: list[str] = []
+            while end < closing:
+                continuation = lines[end]
+                if not continuation.strip() or continuation.lstrip().startswith("#"):
+                    preserved.append(continuation)
+                    end += 1
+                    continue
+                if re.match(r"^[ \t]+-[ \t]*", continuation):
+                    end += 1
+                    continue
+                break
             break
     if start is None or end is None:
         lines.insert(closing, replacement)
     else:
-        lines[start:end] = [replacement]
+        lines[start:end] = [replacement, *preserved]
     return "".join(lines)
 
 
@@ -1602,6 +1681,438 @@ def command_begin(_args: argparse.Namespace) -> int:
                 "Start the requested operation using this base."
                 if not changes
                 else "Review and checkpoint the existing changes before starting unrelated work."
+            ),
+        }
+    )
+    return EXIT_OK
+
+
+def root_tag_plan_rel(vault: Path, plan: Path) -> str | None:
+    if plan.parent != vault or not re.fullmatch(r"tags-review-[A-Za-z0-9_-]+\.csv", plan.name):
+        return None
+    return plan.name
+
+
+def clean_tag_base(vault: Path, value: str, *, allowed_plan: Path | None = None) -> str:
+    ensure_wiki_contract(vault)
+    base = verify_base(vault, value)
+    dirty, staged, untracked = dirty_path_sets(vault)
+    allowed: set[str] = set()
+    invalid_plan_state = False
+    if allowed_plan is not None:
+        rel = root_tag_plan_rel(vault, allowed_plan)
+        tracked = (
+            git_path_set(vault, ["ls-files", "-z", "--", rel])
+            if rel is not None
+            else set()
+        )
+        if rel is not None and os.path.lexists(allowed_plan) and not tracked:
+            allowed.add(rel)
+        elif os.path.lexists(allowed_plan):
+            invalid_plan_state = True
+    if invalid_plan_state or staged or dirty - allowed or untracked - allowed:
+        raise WikiError(
+            "Tag maintenance requires a clean wiki checkpoint.",
+            code=EXIT_CONFLICT,
+            next_step="Review and save the existing changes, then run begin and start tag maintenance again.",
+            details={"changes": change_inventory(vault)},
+        )
+    return base
+
+
+def tag_records(vault: Path) -> list[PageRecord]:
+    pages, _discovery_findings = iter_indexable_pages(vault)
+    head_paths = head_tree_paths(vault)
+    untracked_pages = sorted(
+        exact_rel_text(path.relative_to(vault).as_posix())
+        for path in pages
+        if exact_rel_text(path.relative_to(vault).as_posix()) not in head_paths
+    )
+    if untracked_pages:
+        raise WikiError(
+            "Tag maintenance requires every indexable page to belong to the current HEAD checkpoint.",
+            code=EXIT_CONFLICT,
+            next_step="Review and save or remove the untracked pages, then collect a fresh tag plan.",
+            details={"untracked_pages": untracked_pages},
+        )
+    records, findings = collect_records(vault, strict=True)
+    if findings:
+        raise WikiError(
+            "Tag maintenance requires valid page metadata.",
+            code=EXIT_AUDIT,
+            next_step="Correct the reported page metadata findings and retry.",
+            details={"findings": unique_findings(findings)},
+        )
+    return records
+
+
+def tag_inventory(records: Sequence[PageRecord]) -> tuple[dict[str, int], int]:
+    counts: dict[str, int] = {}
+    tagged_pages = 0
+    for record in records:
+        if record.tags:
+            tagged_pages += 1
+        for tag in record.tags:
+            counts[tag] = counts.get(tag, 0) + 1
+    return counts, tagged_pages
+
+
+def encode_tag_plan_cell(value: str) -> str:
+    if value.startswith("'") or value[:1] in SPREADSHEET_FORMULA_PREFIXES:
+        return "'" + value
+    return value
+
+
+def decode_tag_plan_cell(value: str) -> str:
+    if value.startswith("''") or (
+        value.startswith("'") and value[1:2] in SPREADSHEET_FORMULA_PREFIXES
+    ):
+        decoded = value[1:]
+    elif value[:1] in SPREADSHEET_FORMULA_PREFIXES:
+        raise ValueError("spreadsheet formula-like text must use the generated apostrophe escape")
+    else:
+        decoded = value
+    decoded = unicodedata.normalize("NFC", decoded)
+    if encode_tag_plan_cell(decoded) != value:
+        raise ValueError("tag text does not use the canonical spreadsheet-safe encoding")
+    return decoded
+
+
+def build_tag_plan_bytes(counts: dict[str, int]) -> bytes:
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(TAG_PLAN_HEADER)
+    for tag in sorted(counts, key=lambda item: (item.casefold(), item)):
+        writer.writerow((encode_tag_plan_cell(tag), counts[tag], "keep", ""))
+    return output.getvalue().encode("utf-8")
+
+
+def path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def reject_unsafe_external_path(value: str, *, option: str) -> None:
+    windows_form = value.replace("/", "\\")
+    if windows_form.startswith(("\\\\?\\", "\\\\.\\")):
+        raise WikiError(f"{option} does not accept Windows device or extended paths.")
+    if os.name == "nt":
+        _drive, tail = os.path.splitdrive(value)
+        if ":" in tail:
+            raise WikiError(f"{option} does not accept Windows alternate data streams.")
+
+
+def finish_tag_plan_file(descriptor: int, path: Path, data: bytes) -> None:
+    try:
+        handle = os.fdopen(descriptor, "wb")
+    except BaseException:
+        os.close(descriptor)
+        if os.path.lexists(path):
+            os.unlink(path)
+        raise
+    try:
+        with handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        if os.path.lexists(path):
+            os.unlink(path)
+        raise
+
+
+def write_tag_plan(vault: Path, requested: str | None, data: bytes) -> Path:
+    if requested is None:
+        descriptor, name = tempfile.mkstemp(
+            prefix="tags-review-",
+            suffix=".csv",
+            dir=str(vault),
+        )
+        output = Path(name).resolve()
+        finish_tag_plan_file(descriptor, output, data)
+        return output
+
+    reject_unsafe_external_path(requested, option="--output")
+    output = Path(requested).expanduser().resolve()
+    if path_is_within(output, vault):
+        raise WikiError("--output must be outside the wiki vault.")
+    if os.path.lexists(output):
+        raise WikiError(f"Refusing to overwrite an existing tag plan: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as exc:
+        raise WikiError(f"Refusing to overwrite an existing tag plan: {output}") from exc
+    finish_tag_plan_file(descriptor, output, data)
+    return output
+
+
+def command_tags_collect(args: argparse.Namespace) -> int:
+    vault = vault_from_cwd()
+    base = clean_tag_base(vault, args.base)
+    records = tag_records(vault)
+    counts, page_count = tag_inventory(records)
+    clean_tag_base(vault, base)
+    plan = write_tag_plan(vault, args.output, build_tag_plan_bytes(counts))
+    emit(
+        {
+            "ok": True,
+            "command": "tags",
+            "action": "collect",
+            "vault": str(vault),
+            "base": base,
+            "plan": str(plan),
+            "tag_count": len(counts),
+            "page_count": page_count,
+        }
+    )
+    return EXIT_OK
+
+
+def read_tag_plan(
+    path: Path,
+    counts: dict[str, int],
+) -> tuple[dict[str, tuple[str, str | None]], bytes]:
+    if not path.is_file():
+        raise WikiError(f"Tag plan is not a regular file: {path}")
+    try:
+        plan_bytes = capture_file(path, rel=str(path))
+        text = plan_bytes.decode("utf-8-sig")
+    except FileNotFoundError as exc:
+        raise WikiError(f"Tag plan does not exist: {path}") from exc
+    except UnicodeDecodeError as exc:
+        raise WikiError(f"Tag plan is not valid UTF-8: {path}") from exc
+
+    try:
+        reader = csv.DictReader(io.StringIO(text, newline=""), strict=True)
+        fieldnames = tuple(reader.fieldnames or ())
+        rows = list(reader)
+    except csv.Error as exc:
+        raise WikiError(f"Tag plan contains malformed CSV: {exc}") from exc
+    if fieldnames != TAG_PLAN_HEADER:
+        raise WikiError(
+            "Tag plan has the wrong header; expected: " + ",".join(TAG_PLAN_HEADER)
+        )
+    mapping: dict[str, tuple[str, str | None]] = {}
+    stated_counts: dict[str, int] = {}
+    for number, row in enumerate(rows, start=2):
+        if None in row or any(row.get(field) is None for field in TAG_PLAN_HEADER):
+            raise WikiError(f"Tag plan row {number} has the wrong number of fields.")
+        raw_tag = row["tag"]
+        if not raw_tag:
+            raise WikiError(f"Tag plan row {number} has an empty tag.")
+        try:
+            tag = decode_tag_plan_cell(raw_tag)
+        except ValueError as exc:
+            raise WikiError(f"Tag plan row {number} has an unsafe tag cell: {exc}.") from exc
+        if tag in mapping:
+            raise WikiError(f"Tag plan contains duplicate tag {tag!r}.")
+        raw_count = row["page_count"]
+        if not re.fullmatch(r"[1-9][0-9]*", raw_count):
+            raise WikiError(f"Tag plan row {number} has an invalid page_count.")
+        action = row["action"]
+        if action not in {"keep", "rename", "delete"}:
+            raise WikiError(f"Tag plan row {number} has an invalid action {row['action']!r}.")
+        raw_target = row["target"]
+        try:
+            target = decode_tag_plan_cell(raw_target) if raw_target else ""
+        except ValueError as exc:
+            raise WikiError(f"Tag plan row {number} has an unsafe target cell: {exc}.") from exc
+        if target != target.strip():
+            raise WikiError(f"Tag plan row {number} target has leading or trailing whitespace.")
+        if action == "rename":
+            if not target:
+                raise WikiError(f"Tag plan row {number} must provide a rename target.")
+            if target == tag:
+                raise WikiError(f"Tag plan row {number} cannot rename a tag to itself.")
+            mapped: str | None = target
+        else:
+            if target:
+                raise WikiError(f"Tag plan row {number} action {action!r} requires an empty target.")
+            mapped = tag if action == "keep" else None
+        mapping[tag] = (action, mapped)
+        stated_counts[tag] = int(raw_count)
+
+    if set(mapping) != set(counts):
+        raise WikiError(
+            "Tag plan must contain exactly one row for every current tag.",
+            details={
+                "plan_tags": sorted(mapping),
+                "current_tags": sorted(counts),
+            },
+        )
+    if stated_counts != counts:
+        raise WikiError(
+            "The tag plan no longer matches the current wiki tag inventory.",
+            code=EXIT_CONFLICT,
+            next_step="Run tags collect again and review a fresh plan.",
+            details={
+                "plan_tags": sorted(mapping),
+                "current_tags": sorted(counts),
+            },
+        )
+    for tag, (action, target) in mapping.items():
+        if action != "rename" or target not in mapping:
+            continue
+        target_action, _target_value = mapping[target]
+        if target_action != "keep":
+            raise WikiError(
+                f"Tag {tag!r} targets existing tag {target!r}, which must use action 'keep'."
+            )
+    return mapping, plan_bytes
+
+
+def planned_tag_updates(
+    vault: Path,
+    records: Sequence[PageRecord],
+    mapping: dict[str, tuple[str, str | None]],
+) -> list[tuple[str, Path, bytes, bytes]]:
+    updates: list[tuple[str, Path, bytes, bytes]] = []
+    for record in records:
+        rel, path = safe_rel(vault, record.path, label="tag maintenance page")
+        original = capture_file(path, rel=rel)
+        try:
+            text = original.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise WikiError(f"Markdown is not valid UTF-8: {rel}") from exc
+        values, _body, errors = parse_frontmatter_text(text)
+        raw_tags = values.get("tags", [])
+        if errors or not isinstance(raw_tags, list) or any(
+            not isinstance(item, str) for item in raw_tags
+        ):
+            raise WikiError(
+                f"Page metadata changed while the tag plan was being prepared: {rel}",
+                code=EXIT_CONFLICT,
+                next_step="Run tags collect again and review a fresh plan.",
+            )
+        current = ordered_strings(raw_tags)
+        revised: list[str] = []
+        seen: set[str] = set()
+        for tag in current:
+            decision = mapping.get(tag)
+            if decision is None:
+                raise WikiError(
+                    f"Page tags changed while the tag plan was being prepared: {rel}",
+                    code=EXIT_CONFLICT,
+                    next_step="Run tags collect again and review a fresh plan.",
+                )
+            target = decision[1]
+            if target is not None and target not in seen:
+                seen.add(target)
+                revised.append(target)
+        if tuple(revised) == current:
+            continue
+        updated = replace_frontmatter_list(text, "tags", revised).encode("utf-8")
+        updates.append((rel, path, original, updated))
+    return updates
+
+
+def command_tags_apply(args: argparse.Namespace) -> int:
+    vault = vault_from_cwd()
+    plan = Path(args.plan).expanduser().resolve()
+    allowed_plan = plan if root_tag_plan_rel(vault, plan) is not None else None
+    if path_is_within(plan, vault) and allowed_plan is None:
+        raise WikiError(
+            "A tag plan inside the vault must be the root review CSV created by tags collect."
+        )
+    base = clean_tag_base(vault, args.base, allowed_plan=allowed_plan)
+    records = tag_records(vault)
+    counts, _page_count = tag_inventory(records)
+    mapping, plan_bytes = read_tag_plan(plan, counts)
+    updates = planned_tag_updates(vault, records, mapping)
+    planned_paths = sorted(item[0] for item in updates)
+    summary = {
+        action: sum(1 for item in mapping.values() if item[0] == action)
+        for action in ("keep", "rename", "delete")
+    }
+    clean_tag_base(vault, base, allowed_plan=allowed_plan)
+    if capture_file(plan, rel=str(plan)) != plan_bytes:
+        raise WikiError(
+            "The tag plan changed while it was being reviewed.",
+            code=EXIT_CONFLICT,
+            next_step="Review the current tag plan and retry.",
+        )
+    for rel, path, original, _updated in updates:
+        if capture_file(path, rel=rel) != original:
+            raise WikiError(
+                f"Page changed while the tag plan was being reviewed: {rel}",
+                code=EXIT_CONFLICT,
+                next_step="Run tags collect again and review a fresh plan.",
+            )
+
+    if not args.approved:
+        emit(
+            {
+                "ok": False,
+                "command": "tags",
+                "action": "apply",
+                "vault": str(vault),
+                "base": base,
+                "plan": str(plan),
+                "approved": False,
+                "changed": False,
+                "changed_paths": planned_paths,
+                "mapping": summary,
+                "review_required": True,
+                "next": "Review and confirm the tag plan, then repeat with --approved.",
+            }
+        )
+        return EXIT_REVIEW
+
+    changed_paths: list[str] = []
+    for rel, path, original, updated in updates:
+        if capture_file(path, rel=rel) != original:
+            raise WikiError(
+                f"Page changed while tags were being applied: {rel}",
+                code=EXIT_CONFLICT,
+                next_step="Inspect the visible changes, then collect and review a fresh tag plan.",
+                details={"changed_paths": changed_paths},
+            )
+        try:
+            atomic_write(path, updated, expected=original)
+        except WikiError as exc:
+            raise WikiError(
+                str(exc),
+                code=exc.code,
+                next_step="Inspect the visible changes, then collect and review a fresh tag plan.",
+                details={"changed_paths": changed_paths},
+            ) from exc
+        except OSError as exc:
+            raise WikiError(
+                f"Tag application stopped while writing {rel}: {exc}",
+                code=EXIT_CONFLICT,
+                next_step="Inspect the visible changes before retrying.",
+                details={"changed_paths": changed_paths},
+            ) from exc
+        changed_paths.append(rel)
+
+    if head_oid(vault) != base:
+        raise WikiError(
+            "The wiki HEAD changed while tags were being applied.",
+            code=EXIT_CONFLICT,
+            next_step="Inspect the visible changes, then run begin again.",
+            details={"changed_paths": changed_paths},
+        )
+    emit(
+        {
+            "ok": True,
+            "command": "tags",
+            "action": "apply",
+            "vault": str(vault),
+            "base": base,
+            "plan": str(plan),
+            "approved": True,
+            "changed": bool(changed_paths),
+            "changed_paths": sorted(changed_paths),
+            "mapping": summary,
+            "review_required": False,
+            "next": (
+                "Run save with operation tag-maintenance and the returned changed_paths."
+                if changed_paths
+                else "No page tags changed; no save is needed."
             ),
         }
     )
@@ -2794,6 +3305,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     context.add_argument("--plan", required=True, help="JSON QueryPlan compiled from the user's question.")
     context.set_defaults(func=command_context)
+
+    tags = subparsers.add_parser(
+        "tags",
+        help="Collect and apply a user-approved tag normalization plan.",
+        description="Run the manually triggered workflow for reviewing and normalizing page tags.",
+    )
+    tag_actions = tags.add_subparsers(dest="tags_action", required=True)
+    tags_collect = tag_actions.add_parser(
+        "collect",
+        help="Collect the current tag inventory into a review CSV.",
+        description="Collect tags into a review CSV without changing Markdown, index.csv, Git HEAD, or the Git index.",
+    )
+    tags_collect.add_argument(
+        "--base",
+        required=True,
+        help="Clean Git commit OID returned by begin; HEAD and the worktree must still match it.",
+    )
+    tags_collect.add_argument(
+        "--output",
+        help="Optional new CSV path outside the vault; defaults to a unique review CSV in the vault root.",
+    )
+    tags_collect.set_defaults(func=command_tags_collect)
+    tags_apply = tag_actions.add_parser(
+        "apply",
+        help="Apply a reviewed tag normalization CSV to page frontmatter.",
+        description="Validate a reviewed tag plan against a clean base and update only affected page tags.",
+    )
+    tags_apply.add_argument(
+        "--base",
+        required=True,
+        help="The same clean Git commit OID used to collect the reviewed tag plan.",
+    )
+    tags_apply.add_argument(
+        "--plan",
+        required=True,
+        help="Reviewed CSV created by tags collect.",
+    )
+    tags_apply.add_argument(
+        "--approved",
+        action="store_true",
+        help="Confirm that the user reviewed and approved the complete tag plan.",
+    )
+    tags_apply.set_defaults(func=command_tags_apply)
 
     audit = subparsers.add_parser(
         "audit",

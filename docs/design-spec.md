@@ -246,6 +246,20 @@ Git 指出哪些文档发生变化，LLM 判断 `summary`、`aliases` 和 `tags`
 
 索引维护的 token 成本取决于本次语义变化，而不是 vault 总大小。
 
+### 5.4 标签规范化
+
+全库标签规范化是用户手动触发的维护流程，不由页面创建、`audit` 或 `save` 自动启动。页面 frontmatter 中的 `tags` 始终是事实源，不建立持久标签注册表。
+
+流程使用同一份临时 CSV。默认文件名为 `tags-review-<random>.csv`，直接生成在 wiki 根目录；显式 `--output` 只能指定 vault 外的新文件。
+
+1. 从干净的 base 运行 `tags collect`。Python 扫描全部可索引页面的文件头，以稳定顺序生成 `tag,page_count,action,target`；每个不同标签一行，初始 `action` 为 `keep`，`target` 为空。可能触发电子表格公式解析的标签单元格使用可逆前导 `'` 编码。
+2. LLM 把 `action` 调整为 `keep`、`rename` 或 `delete`，只为 `rename` 填写 `target`。名称含义不明确时，通过带 `required_tags` 的 QueryPlan 查询相关页面并阅读真实 Markdown。
+3. 用户审阅并修订 CSV。未经用户明确批准，Python 只验证和预览方案，不修改页面。
+4. Python 在 base 和页面状态未变化时应用已批准方案。默认根级计划文件可以是唯一额外的临时工作流文件；其他 dirty、staged 或 untracked 状态都使操作失败。应用只修改相关页面的 `tags`，多对一映射按首次出现顺序去重，未知 Properties、其他元数据和正文保持不变。
+5. 现有 `save` 只接收受影响页面路径，重建 `index.csv`、审计并创建检查点。计划文件保持未跟踪，不自动删除。
+
+临时 CSV 只是 LLM 提案与人工审批的载体，不属于持久 wiki，不进入索引或检查点。Python 拒绝缺行、重复行、未知动作、非法目标或已过期的方案，不自行选择规范名称或删除标签。保存后文件仍保留在原位置；它可能依本地 ignore 规则显示为未跟踪或被忽略，由用户决定继续保留、移出或删除。
+
 ## 6. 检索合同
 
 ### 6.1 默认管线
@@ -311,7 +325,7 @@ vault 根目录必须是专用 Git worktree 的根目录；可以使用 linked w
 | 级别 | 例子 | 默认行为 |
 |---|---|---|
 | 常规 | 按用户要求新增 raw、来源页或笔记，同步元数据，修复明确链接，重建索引 | `audit` 通过后可自动提交 |
-| 需审阅 | 人工编辑检查点、改名、删除、合并、拆分、大幅改写用户内容、改变来源关系、解决冲突 | 展示差异，用户确认后提交 |
+| 需审阅 | 人工编辑检查点、全库标签规范化、改名、删除、合并、拆分、大幅改写用户内容、改变来源关系、解决冲突 | 展示方案或差异，用户确认后写入或提交 |
 | 禁止 | 修改或覆盖已提交 raw、丢弃未确认修改、提交无关文件、由 Python 编造语义元数据 | 停止并说明原因 |
 
 用户可以要求审阅任何常规操作。常规自动提交不等于自动决定语义；`summary`、`tags`、页面边界和证据判断仍由 LLM 在写入前完成。
@@ -337,6 +351,8 @@ python scripts/wiki.py <command> --help
 | `begin` | 当前 vault | 返回基线、dirty 状态和需要先处理的人类或 LLM 变更 |
 | `add INPUT... --base OID --name PAGE_NAME` | 材料、基线和 Unicode 页面名 | 安装 raw，创建或更新来源草稿，报告重复与冲突 |
 | `context --plan JSON` | LLM 生成的 QueryPlan | 返回候选 JSON，可通过 `limit` 限制数量，必要时请求全文回退 |
+| `tags collect --base OID [--output CSV]` | 干净基线和可选的 vault 外新文件 | 默认在根目录生成唯一标签评审表并返回其路径 |
+| `tags apply --base OID --plan CSV [--approved]` | 同一基线和完整评审表 | 未批准时验证并预览；批准后只更新页面标签并返回变化路径 |
 | `audit [--scope changed\|all]` | 当前 wiki | `all` 完整检查仓库健康，`changed` 聚焦变化范围 |
 | `save --base OID --operation KIND --include PATH... [--approved]` | 本次明确变更 | 重建索引、审计，并在满足风险规则后创建检查点 |
 
@@ -349,8 +365,10 @@ CLI 面向 LLM 的正常输出为 JSON。错误必须指出操作、文件和可
 - `add` 不覆盖已有 raw 或页面；
 - `add` 返回待处理状态，不代表工作流已经完成；
 - `context` 与 `audit` 不写文件；
+- `tags collect` 要求写入前工作树完全干净；省略 `--output` 时只在 wiki 根目录创建未跟踪的 `tags-review-<random>.csv`，显式输出必须位于 vault 外且不能覆盖已有文件，不修改 Git 暂存区或 HEAD；
+- `tags apply` 要求调用者原样复用 collect 返回的 base，且页面状态仍然有效；只允许传入的默认根级计划作为唯一额外临时文件，无论本地 ignore 规则是否隐藏它；未提供 `--approved` 时返回退出码 `5` 且不写页面，批准后也不改动计划文件、不重建索引或提交；
 - `audit` 只要求当前目录可以定位为 Git worktree 根；结构损坏时尽量返回完整 findings；
-- `begin`、`add`、`context` 和 `save` 严格拒绝不满足仓库合同的 wiki；
+- `begin`、`add`、`context`、`tags` 和 `save` 严格拒绝不满足仓库合同的 wiki；
 - `save` 与独立 `audit` 使用同一审计规则，并允许在审计候选检查点前重建缺失的 `index.csv`；
 - `save` 的候选检查点只包含明确纳入的路径及其必需生成物；
 - 需审阅操作没有 `--approved` 时只返回差异，不提交；
@@ -425,12 +443,13 @@ skills/llm-wiki/
 
 任务：
 
-- 实现 `init`、`begin`、`add`、`context`、`audit` 和 `save`；
+- 实现 `init`、`begin`、`add`、`context`、`tags`、`audit` 和 `save`；
 - 实现未提交变化的只读检索视图；
+- 实现标签清单、人工评审方案和确定性应用流程；
 - 实现常规与需审阅的 Git 检查点；
 - 建立端到端测试样例。
 
-出口标准：从创建 vault、摄入材料、自然语言查询、Obsidian 人工编辑到再次保存可以完整运行。
+出口标准：从创建 vault、摄入材料、自然语言查询、标签维护、Obsidian 人工编辑到再次保存可以完整运行。
 
 ### 10.4 技能资源
 
@@ -500,13 +519,13 @@ skills/llm-wiki/
 ### 11.7 技能交付
 
 - `skills/llm-wiki/` 是唯一可安装目录，只包含运行所需的 `SKILL.md`、`agents/`、`scripts/`、`references/` 和 `templates/`。
-- `SKILL.md` frontmatter 只有 `name` 和 `description`，description 能触发创建、摄入、查询、审计和维护任务。
+- `SKILL.md` frontmatter 只有 `name` 和 `description`，description 能触发创建、摄入、查询、标签规范化、审计和维护任务。
 - `agents/openai.yaml` 与 `SKILL.md` 保持一致，且不增加未要求的界面字段。
 - `SKILL.md` 少于 500 行，只保留核心职责、路由和安全边界。
 - 每个参考文档都由 `SKILL.md` 直接链接并注明加载条件；参考文档之间不形成必读链。
 - 路由测试证明普通查询只加载查询指南，摄入、维护和 Obsidian 任务只增加各自需要的指南。
 - 模板生成的页面符合页面合同，正常操作文档使用 `wiki.py`。
-- `SKILL.md` 说明六个公共子命令来自随附的 `wiki.py`，提供总帮助、子命令帮助、简短用途地图和工作流文档路由，不复制精确参数表。
+- `SKILL.md` 说明七个公共子命令来自随附的 `wiki.py`，提供总帮助、子命令帮助、简短用途地图和工作流文档路由，不复制精确参数表。
 - 每个子命令的 `--help` 解释自身用途及参数，`--help` 是精确 CLI 接口的唯一事实源。
 - 技能和文档以中文作为主要语言，正文按语义段落换行，不使用固定宽度排版换行。
 - Python 运行时支持 3.10+，且仅使用标准库。
@@ -527,3 +546,13 @@ python skills/llm-wiki/scripts/wiki.py --help
 3. 用户在 Obsidian 中修改并重命名页面；系统先形成人工编辑检查点，再继续 LLM 工作。
 4. 用户用自然语言跨来源页与笔记查询；系统通过索引候选、链接扩展和必要的 raw 核对回答。
 5. 索引被删除或手工修改后，`audit` 发现漂移，`save` 从 Markdown 文件头确定性重建，并在重复运行时保持字节不变。
+6. 用户明确要求规范标签；系统默认在 wiki 根目录生成未跟踪评审表，LLM 提案，用户修订并批准，Python 更新页面，`save` 排除评审表、重建索引并形成检查点。
+
+### 11.9 标签管理
+
+- 普通页面维护、`audit` 和 `save` 不会自动启动全库标签规范化。
+- `tags collect` 为每个现有标签生成一行稳定的 `tag,page_count,action,target`；除默认创建根级未跟踪评审表外，不改变页面、HEAD、暂存区或 `index.csv`，也不把临时 CSV 加入 Git。
+- 中文以及包含逗号、引号或 `/` 的标签能够在 CSV 中无损往返；空标签集合只生成表头并报告无需应用。
+- LLM 可以提出保留、重命名或删除方案；歧义项通过 `required_tags` 查询有限页面，提案阶段不修改 wiki。
+- 未批准、缺行、重复、非法或已过期的方案不写文件；用户批准后只修改受影响页面的 `tags`，多对一结果去重并保留其他 Properties 和正文。
+- `tags apply` 返回的页面可以由现有 `save` 精确纳入；保存后 `index.csv` 与页面 frontmatter 一致，临时评审表不进入检查点、不被自动删除，并继续留在原位置。

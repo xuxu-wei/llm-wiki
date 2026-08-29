@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import contextlib
 import importlib.util
 import io
@@ -31,6 +32,50 @@ from tests.wiki_support import (
 
 
 INDEX_HEADER = ["path", "kind", "summary", "aliases", "tags"]
+TAG_PLAN_HEADER = ["tag", "page_count", "action", "target"]
+SPREADSHEET_FORMULA_PREFIXES = frozenset("=+-@\t\r\n")
+
+
+def tag_plan_cell(value: str) -> str:
+    if value.startswith("'") or value[:1] in SPREADSHEET_FORMULA_PREFIXES:
+        return "'" + value
+    return value
+
+
+def read_tag_plan(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        return list(reader.fieldnames or []), list(reader)
+
+
+def write_tag_plan(
+    path: Path,
+    rows: list[dict[str, str]],
+    *,
+    header: list[str] | None = None,
+) -> None:
+    fieldnames = header or TAG_PLAN_HEADER
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def decide_tag(
+    path: Path,
+    tag: str,
+    action: str,
+    target: str = "",
+) -> None:
+    header, rows = read_tag_plan(path)
+    if header != TAG_PLAN_HEADER:
+        raise AssertionError(f"unexpected tag plan header: {header!r}")
+    matches = [row for row in rows if row["tag"] == tag_plan_cell(tag)]
+    if len(matches) != 1:
+        raise AssertionError(f"expected one tag-plan row for {tag!r}: {rows!r}")
+    matches[0]["action"] = action
+    matches[0]["target"] = target
+    write_tag_plan(path, rows)
 
 
 def load_wiki_runtime():
@@ -100,12 +145,57 @@ class WikiCliTestCase(unittest.TestCase):
         self.assert_envelope(payload, "save", vault, ok=expected == 0)
         return payload
 
+    def collect_tags(
+        self,
+        vault: Path,
+        base: str,
+        *,
+        output: Path | None = None,
+        expected: int = 0,
+    ) -> tuple[dict[str, object], Path | None]:
+        arguments = ["tags", "collect", "--base", base]
+        if output is not None:
+            arguments.extend(["--output", str(output)])
+        result = run_cli(*arguments, cwd=vault)
+        payload = self.assert_exit(result, expected)
+        self.assert_envelope(payload, "tags", vault, ok=expected == 0)
+        if expected == 0 or "action" in payload:
+            self.assertEqual(payload.get("action"), "collect", payload)
+        if expected != 0:
+            return payload, None
+        plan_value = payload.get("plan")
+        self.assertIsInstance(plan_value, str, payload)
+        assert isinstance(plan_value, str)
+        plan = Path(plan_value)
+        self.assertTrue(plan.is_absolute(), plan)
+        self.assertTrue(plan.is_file(), plan)
+        return payload, plan
+
+    def apply_tags(
+        self,
+        vault: Path,
+        base: str,
+        plan: Path,
+        *,
+        approved: bool = False,
+        expected: int = 0,
+    ) -> dict[str, object]:
+        arguments = ["tags", "apply", "--base", base, "--plan", str(plan)]
+        if approved:
+            arguments.append("--approved")
+        result = run_cli(*arguments, cwd=vault)
+        payload = self.assert_exit(result, expected)
+        self.assert_envelope(payload, "tags", vault, ok=expected == 0)
+        if expected == 0 or "action" in payload:
+            self.assertEqual(payload.get("action"), "apply", payload)
+        return payload
+
 
 class InitAndSchemaTests(WikiCliTestCase):
     def test_help_exposes_the_current_commands(self) -> None:
         result = run_cli("--help")
         self.assertEqual(result.returncode, 0, result.diagnostic())
-        for command in ("init", "begin", "add", "context", "audit", "save"):
+        for command in ("init", "begin", "add", "context", "audit", "save", "tags"):
             self.assertRegex(result.stdout, rf"\b{command}\b")
 
     def test_init_creates_a_unicode_obsidian_vault_and_clean_checkpoint(self) -> None:
@@ -188,6 +278,704 @@ class InitAndSchemaTests(WikiCliTestCase):
             self.assert_envelope(payload, "init", vault, ok=False)
             self.assertEqual(snapshot_files(vault), before)
             self.assertFalse((vault / ".git").exists())
+
+
+class TagMaintenanceTests(WikiCliTestCase):
+    def test_collect_is_read_only_deterministic_and_handles_special_tags(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vault = self.init_vault(root)
+            home = vault / "首页.md"
+            home.write_text(
+                home.read_text(encoding="utf-8").replace("tags: []", 'tags: ["MOC标签"]'),
+                encoding="utf-8",
+                newline="\n",
+            )
+            source = write_page(
+                vault,
+                "sources/标签来源.md",
+                "标签来源",
+                "source",
+                summary="覆盖来源页的标签收集。",
+                aliases=[],
+                tags=["来源标签"],
+                sources=[],
+                raw=[],
+            )
+            note = write_page(
+                vault,
+                "notes/标签样本.md",
+                "标签样本",
+                "note",
+                summary="覆盖标签清单中的 Unicode 和 CSV 特殊字符。",
+                aliases=[],
+                tags=["AI", "ai", "中文,标签", '引"号', "层级/标签", "=1+1", "AI"],
+                sources=[],
+                body="正文中的 #正文标签 不进入标签清单。",
+            )
+            inbox = write_page(
+                vault,
+                "inbox/待整理.md",
+                "待整理",
+                "inbox",
+                tags=["AI"],
+                body="等待整理的用户输入。",
+            )
+            self.save(
+                vault,
+                git_head(vault),
+                include=["首页.md", "sources/标签来源.md", "notes/标签样本.md", "inbox/待整理.md"],
+            )
+            self.assertTrue(home.is_file())
+            self.assertTrue(source.is_file())
+            self.assertTrue(note.is_file())
+            self.assertTrue(inbox.is_file())
+            base = git_head(vault)
+            vault_before = snapshot_files(vault)
+            index_before = (vault / "index.csv").read_bytes()
+            git_index_before = (vault / ".git" / "index").read_bytes()
+
+            first_output = root / "第一次 标签审阅.csv"
+            first_payload, first_plan = self.collect_tags(vault, base, output=first_output)
+            self.assertEqual(first_plan, first_output.resolve())
+            self.assertEqual(first_payload.get("base"), base)
+            self.assertEqual(first_payload.get("tag_count"), 8)
+            self.assertEqual(first_payload.get("page_count"), 4)
+            header, rows = read_tag_plan(first_plan)
+            self.assertEqual(header, TAG_PLAN_HEADER)
+            self.assertEqual(
+                {row["tag"]: row for row in rows},
+                {
+                    tag_plan_cell(tag): {
+                        "tag": tag_plan_cell(tag),
+                        "page_count": str(count),
+                        "action": "keep",
+                        "target": "",
+                    }
+                    for tag, count in {
+                        "AI": 2,
+                        "ai": 1,
+                        "中文,标签": 1,
+                        '引"号': 1,
+                        "层级/标签": 1,
+                        "=1+1": 1,
+                        "MOC标签": 1,
+                        "来源标签": 1,
+                    }.items()
+                },
+            )
+            self.assertNotIn("正文标签", {row["tag"] for row in rows})
+            self.assertNotIn(b"\r\n", first_plan.read_bytes())
+            self.assertEqual(snapshot_files(vault), vault_before)
+            self.assertEqual((vault / "index.csv").read_bytes(), index_before)
+            self.assertEqual((vault / ".git" / "index").read_bytes(), git_index_before)
+            self.assertEqual(git_head(vault), base)
+            self.assertEqual(git_status(vault), [])
+
+            second_output = root / "第二次.csv"
+            _second_payload, second_plan = self.collect_tags(vault, base, output=second_output)
+            self.assertEqual(second_plan.read_bytes(), first_plan.read_bytes())
+
+            existing_before = first_plan.read_bytes()
+            self.collect_tags(vault, base, output=first_plan, expected=2)
+            self.assertEqual(first_plan.read_bytes(), existing_before)
+            inside = vault / "标签审阅.csv"
+            self.collect_tags(vault, base, output=inside, expected=2)
+            self.assertFalse(inside.exists())
+            runtime = load_wiki_runtime()
+            for unsafe in (r"\\?\C:\vault\.git\index.lock", r"\\.\C:\device.csv"):
+                with self.subTest(unsafe_output=unsafe):
+                    with self.assertRaises(runtime.WikiError):
+                        runtime.reject_unsafe_external_path(unsafe, option="--output")
+            if os.name == "nt":
+                index_lock = vault / ".git" / "index.lock"
+                extended = Path("\\\\?\\" + str(index_lock))
+                self.collect_tags(vault, base, output=extended, expected=2)
+                self.assertFalse(index_lock.exists())
+            self.assertEqual(snapshot_files(vault), vault_before)
+
+    def test_collect_empty_inventory_creates_only_an_editable_root_review_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vault = self.init_vault(root)
+            base = git_head(vault)
+            before = snapshot_files(vault)
+            git_index_before = (vault / ".git" / "index").read_bytes()
+            payload, plan = self.collect_tags(vault, base)
+            try:
+                self.assertEqual(payload.get("tag_count"), 0)
+                self.assertEqual(payload.get("page_count"), 0)
+                self.assertEqual(plan.parent.resolve(), vault.resolve())
+                self.assertRegex(plan.name, r"^tags-review-.+\.csv$")
+                self.assertEqual(read_tag_plan(plan), (TAG_PLAN_HEADER, []))
+                plan_before = plan.read_bytes()
+                with plan.open("a", encoding="utf-8", newline="") as handle:
+                    handle.write("")
+                after = snapshot_files(vault)
+                plan_rel = plan.relative_to(vault).as_posix()
+                self.assertEqual(set(after) - set(before), {plan_rel})
+                self.assertEqual({key: after[key] for key in before}, before)
+                self.assertEqual(after[plan_rel], plan_before)
+                self.assertEqual(git_head(vault), base)
+                self.assertEqual((vault / ".git" / "index").read_bytes(), git_index_before)
+                status = run_git(
+                    vault,
+                    "-c",
+                    "core.quotepath=false",
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                )
+                self.assertEqual(str(status.stdout).splitlines(), [f"?? {plan.name}"])
+
+                other = vault / "other-untracked.txt"
+                other.write_text("不能随 review CSV 一并豁免。\n", encoding="utf-8", newline="\n")
+                conflict_before = snapshot_files(vault)
+                self.apply_tags(vault, base, plan, approved=True, expected=3)
+                self.assertEqual(snapshot_files(vault), conflict_before)
+                other.unlink()
+
+                applied = self.apply_tags(vault, base, plan, approved=True)
+                self.assertIs(applied.get("changed"), False, applied)
+                self.assertEqual(applied.get("changed_paths"), [], applied)
+                self.assertEqual(plan.read_bytes(), plan_before)
+                self.assertEqual((vault / ".git" / "index").read_bytes(), git_index_before)
+
+                run_git(vault, "add", "--", plan.name)
+                staged_index = (vault / ".git" / "index").read_bytes()
+                self.apply_tags(vault, base, plan, approved=True, expected=3)
+                self.assertEqual((vault / ".git" / "index").read_bytes(), staged_index)
+                self.assertEqual(plan.read_bytes(), plan_before)
+            finally:
+                plan.unlink(missing_ok=True)
+            self.assertEqual(snapshot_files(vault), before)
+
+    def test_default_root_plan_may_be_ignored_without_blocking_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            vault = self.init_vault(Path(temp_dir))
+            exclude = vault / ".git" / "info" / "exclude"
+            with exclude.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write("\n/tags-review-*.csv\n")
+            base = git_head(vault)
+
+            _payload, plan = self.collect_tags(vault, base)
+            try:
+                plan_before = plan.read_bytes()
+                self.assertEqual(git_status(vault), [])
+                applied = self.apply_tags(vault, base, plan, approved=True)
+                self.assertIs(applied.get("changed"), False, applied)
+                self.assertEqual(applied.get("changed_paths"), [], applied)
+                self.assertEqual(plan.read_bytes(), plan_before)
+                tracked = run_git(vault, "ls-files", "--", plan.name)
+                self.assertEqual(str(tracked.stdout).strip(), "")
+            finally:
+                plan.unlink(missing_ok=True)
+
+    def test_ignored_untracked_pages_block_collect_and_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vault = self.init_vault(root)
+            tracked = write_page(
+                vault,
+                "notes/已跟踪.md",
+                "已跟踪",
+                "note",
+                summary="标签计划只能基于当前 HEAD 中的页面。",
+                aliases=[],
+                tags=["已跟踪标签"],
+                sources=[],
+            )
+            self.save(vault, git_head(vault), include=["notes/已跟踪.md"])
+            self.assertTrue(tracked.is_file())
+            base = git_head(vault)
+            plan_path = root / "ignored-page-review.csv"
+            _payload, plan = self.collect_tags(vault, base, output=plan_path)
+
+            exclude = vault / ".git" / "info" / "exclude"
+            with exclude.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write("\n/notes/ignored.md\n")
+            ignored = write_page(
+                vault,
+                "notes/ignored.md",
+                "ignored",
+                "note",
+                summary="被 Git ignore 隐藏的新页面不能混入标签维护。",
+                aliases=[],
+                tags=["隐藏标签"],
+                sources=[],
+            )
+            self.assertEqual(git_status(vault), [])
+            before = snapshot_files(vault)
+
+            self.collect_tags(
+                vault,
+                base,
+                output=root / "must-not-exist.csv",
+                expected=3,
+            )
+            self.apply_tags(vault, base, plan, approved=True, expected=3)
+
+            self.assertEqual(snapshot_files(vault), before)
+            self.assertEqual(git_head(vault), base)
+            self.assertTrue(ignored.is_file())
+            self.assertFalse((root / "must-not-exist.csv").exists())
+
+    def test_apply_requires_approval_and_rejects_invalid_or_stale_plans_without_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vault = self.init_vault(root)
+            page = write_page(
+                vault,
+                "notes/旧标签.md",
+                "旧标签",
+                "note",
+                summary="用于验证标签计划的审批和冲突边界。",
+                aliases=[],
+                tags=["旧标签"],
+                sources=[],
+            )
+            self.save(vault, git_head(vault), include=["notes/旧标签.md"])
+            base = git_head(vault)
+            _payload, plan = self.collect_tags(vault, base, output=root / "review.csv")
+            decide_tag(plan, "旧标签", "rename", "新标签")
+            page_before = page.read_bytes()
+            index_before = (vault / "index.csv").read_bytes()
+            git_index_before = (vault / ".git" / "index").read_bytes()
+            plan_before = plan.read_bytes()
+
+            review = self.apply_tags(vault, base, plan, expected=5)
+            self.assertIs(review.get("review_required"), True, review)
+            self.assertIs(review.get("changed"), False, review)
+            self.assertEqual(review.get("changed_paths"), ["notes/旧标签.md"], review)
+            self.assertEqual(page.read_bytes(), page_before)
+            self.assertEqual((vault / "index.csv").read_bytes(), index_before)
+            self.assertEqual((vault / ".git" / "index").read_bytes(), git_index_before)
+            self.assertEqual(plan.read_bytes(), plan_before)
+
+            header, rows = read_tag_plan(plan)
+            invalid_cases: dict[str, tuple[int, list[str], list[dict[str, str]]]] = {
+                "wrong-header": (2, ["tag", "action", "target"], [{
+                    "tag": "旧标签", "action": "rename", "target": "新标签"
+                }]),
+                "duplicate-source": (2, header, [rows[0], dict(rows[0])]),
+                "missing-source": (2, header, []),
+                "extra-source": (2, header, [*rows, {
+                    "tag": "不存在", "page_count": "1", "action": "keep", "target": ""
+                }]),
+                "count-changed": (3, header, [{**rows[0], "page_count": "2"}]),
+                "invalid-action": (2, header, [{**rows[0], "action": "merge"}]),
+                "rename-without-target": (2, header, [{**rows[0], "target": ""}]),
+                "keep-with-target": (2, header, [{**rows[0], "action": "keep", "target": "意外目标"}]),
+                "delete-with-target": (2, header, [{**rows[0], "action": "delete", "target": "意外目标"}]),
+                "unsafe-target": (2, header, [{**rows[0], "target": "=HYPERLINK(\"x\")"}]),
+                "extra-column": (2, [*header, "reason"], [{**rows[0], "reason": "不支持"}]),
+            }
+            for name, (expected_exit, case_header, case_rows) in invalid_cases.items():
+                with self.subTest(case=name):
+                    write_tag_plan(plan, case_rows, header=case_header)
+                    before = snapshot_files(vault)
+                    self.apply_tags(vault, base, plan, approved=True, expected=expected_exit)
+                    self.assertEqual(snapshot_files(vault), before)
+                    self.assertEqual(git_head(vault), base)
+                    self.assertEqual(git_status(vault), [])
+                    plan.write_bytes(plan_before)
+
+            plan.write_bytes(b"\xff\xfe\x00")
+            self.apply_tags(vault, base, plan, approved=True, expected=2)
+            self.assertEqual(page.read_bytes(), page_before)
+            plan.write_bytes(plan_before)
+
+            plan.write_text(
+                'tag,page_count,action,target\n"旧标签,1,rename,新标签\n',
+                encoding="utf-8",
+                newline="\n",
+            )
+            self.apply_tags(vault, base, plan, approved=True, expected=2)
+            self.assertEqual(page.read_bytes(), page_before)
+            plan.write_bytes(plan_before)
+
+            arbitrary_root_plan = vault / "manual-tags.csv"
+            arbitrary_root_plan.write_bytes(plan.read_bytes())
+            arbitrary_before = snapshot_files(vault)
+            self.apply_tags(vault, base, arbitrary_root_plan, approved=True, expected=2)
+            self.assertEqual(snapshot_files(vault), arbitrary_before)
+            arbitrary_root_plan.unlink()
+
+            unrelated = vault / "pending.txt"
+            unrelated.write_text("未完成工作。\n", encoding="utf-8", newline="\n")
+            dirty_before = snapshot_files(vault)
+            self.apply_tags(vault, base, plan, approved=True, expected=3)
+            self.assertEqual(snapshot_files(vault), dirty_before)
+            unrelated.unlink()
+
+            page.write_text(
+                page.read_text(encoding="utf-8").replace('["旧标签"]', '["另一个标签"]'),
+                encoding="utf-8",
+                newline="\n",
+            )
+            stale_before = snapshot_files(vault)
+            self.apply_tags(vault, base, plan, approved=True, expected=3)
+            self.assertEqual(snapshot_files(vault), stale_before)
+            self.assertEqual((vault / "index.csv").read_bytes(), index_before)
+            self.assertEqual((vault / ".git" / "index").read_bytes(), git_index_before)
+            self.assertEqual(git_head(vault), base)
+
+            self.save(vault, base, operation="edit", include=["notes/旧标签.md"])
+            current = git_head(vault)
+            head_changed_before = snapshot_files(vault)
+            self.apply_tags(vault, base, plan, approved=True, expected=3)
+            self.assertEqual(snapshot_files(vault), head_changed_before)
+            self.assertEqual(git_head(vault), current)
+
+    def test_apply_detects_a_same_page_edit_at_the_atomic_write_boundary(self) -> None:
+        runtime = load_wiki_runtime()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vault = self.init_vault(root)
+            page = write_page(
+                vault,
+                "notes/并发编辑.md",
+                "并发编辑",
+                "note",
+                summary="标签应用不得覆盖同页并发人工编辑。",
+                aliases=[],
+                tags=["旧标签"],
+                sources=[],
+                body="ORIGINAL BODY",
+            )
+            self.save(vault, git_head(vault), include=["notes/并发编辑.md"])
+            base = git_head(vault)
+            _payload, plan = self.collect_tags(vault, base, output=root / "race-review.csv")
+            decide_tag(plan, "旧标签", "rename", "新标签")
+            index_before = (vault / "index.csv").read_bytes()
+            original_fdopen = runtime.os.fdopen
+            injected = False
+
+            class EditAfterTemporaryWrite:
+                def __init__(self, handle):
+                    self.handle = handle
+
+                def __enter__(self):
+                    return self.handle.__enter__()
+
+                def __exit__(self, exc_type, exc, traceback):
+                    nonlocal injected
+                    result = self.handle.__exit__(exc_type, exc, traceback)
+                    if not injected:
+                        injected = True
+                        page.write_text(
+                            page.read_text(encoding="utf-8").replace(
+                                "ORIGINAL BODY",
+                                "CONCURRENT HUMAN EDIT",
+                            ),
+                            encoding="utf-8",
+                            newline="\n",
+                        )
+                    return result
+
+            def edit_when_temporary_file_closes(descriptor, *args, **kwargs):
+                return EditAfterTemporaryWrite(original_fdopen(descriptor, *args, **kwargs))
+
+            args = SimpleNamespace(base=base, plan=str(plan), approved=True)
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(vault)
+                with mock.patch.object(
+                    runtime.os,
+                    "fdopen",
+                    side_effect=edit_when_temporary_file_closes,
+                ):
+                    with self.assertRaises(runtime.WikiError) as raised:
+                        runtime.command_tags_apply(args)
+            finally:
+                os.chdir(previous_cwd)
+
+            self.assertTrue(injected)
+            self.assertEqual(raised.exception.code, 3)
+            current = page.read_text(encoding="utf-8")
+            self.assertIn("CONCURRENT HUMAN EDIT", current)
+            self.assertIn('tags: ["旧标签"]', current)
+            self.assertNotIn('tags: ["新标签"]', current)
+            self.assertEqual((vault / "index.csv").read_bytes(), index_before)
+            self.assertEqual(git_head(vault), base)
+
+    def test_apply_is_exact_preserves_other_bytes_and_is_noop_for_keep(self) -> None:
+        runtime = load_wiki_runtime()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vault = self.init_vault(root)
+            page = vault / "notes" / "保真.md"
+            original = (
+                "\ufeff---\n"
+                "kind: note\n"
+                "summary: 保留未知属性、注释和正文。\n"
+                "aliases: []\n"
+                "tags:\n"
+                "  - \"旧,标签\"\n"
+                "  # 用户注释必须保留\n"
+                "  - 保留\n"
+                "sources: []\n"
+                "custom-nested:\n"
+                "  tags: not-managed\n"
+                "  owner: user\n"
+                "---\n"
+                "# 保真\n\n"
+                "正文中的 tags: 旧,标签 不是属性。\n"
+            ).encode("utf-8")
+            page.write_bytes(original)
+            self.save(vault, git_head(vault), include=["notes/保真.md"])
+            base = git_head(vault)
+            _payload, plan = self.collect_tags(vault, base, output=root / "preserve.csv")
+            page_mtime = page.stat().st_mtime_ns
+            index_before = (vault / "index.csv").read_bytes()
+            keep_plan_before = plan.read_bytes()
+
+            noop = self.apply_tags(vault, base, plan, approved=True)
+            self.assertIs(noop.get("approved"), True, noop)
+            self.assertIs(noop.get("changed"), False, noop)
+            self.assertEqual(noop.get("changed_paths"), [], noop)
+            self.assertEqual(page.read_bytes(), original)
+            self.assertEqual(page.stat().st_mtime_ns, page_mtime)
+            self.assertEqual((vault / "index.csv").read_bytes(), index_before)
+            self.assertEqual(plan.read_bytes(), keep_plan_before)
+            self.assertEqual(git_status(vault), [])
+
+            decide_tag(plan, "旧,标签", "rename", "新标签")
+            approved_plan = plan.read_bytes()
+            applied = self.apply_tags(vault, base, plan, approved=True)
+            self.assertIs(applied.get("approved"), True, applied)
+            self.assertIs(applied.get("changed"), True, applied)
+            self.assertEqual(applied.get("changed_paths"), ["notes/保真.md"], applied)
+            expected = original.replace(
+                b'tags:\n  - "\xe6\x97\xa7,\xe6\xa0\x87\xe7\xad\xbe"\n'
+                b'  # \xe7\x94\xa8\xe6\x88\xb7\xe6\xb3\xa8\xe9\x87\x8a\xe5\xbf\x85\xe9\xa1\xbb\xe4\xbf\x9d\xe7\x95\x99\n'
+                b'  - \xe4\xbf\x9d\xe7\x95\x99\n',
+                'tags: ["新标签", "保留"]\n  # 用户注释必须保留\n'.encode("utf-8"),
+            )
+            self.assertEqual(page.read_bytes(), expected)
+            values, _body, errors = runtime.parse_frontmatter_text(page.read_text(encoding="utf-8"))
+            self.assertEqual(errors, [])
+            self.assertEqual(values.get("tags"), ["新标签", "保留"])
+            self.assertIn(b"  tags: not-managed\n", page.read_bytes())
+            self.assertIn("正文中的 tags: 旧,标签".encode("utf-8"), page.read_bytes())
+            self.assertEqual((vault / "index.csv").read_bytes(), index_before)
+            self.assertEqual(plan.read_bytes(), approved_plan)
+            self.assertEqual(git_head(vault), base)
+            status = git_status(vault)
+            self.assertEqual(len(status), 1, status)
+            self.assertIn("notes/", status[0])
+
+    def test_mapping_rules_reject_chains_and_preserve_order_for_valid_merges(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vault = self.init_vault(root)
+            page = write_page(
+                vault,
+                "notes/tag-order.md",
+                "tag-order",
+                "note",
+                summary="标签映射按页面首次出现顺序去重。",
+                aliases=[],
+                tags=["A", "a", "B", "A", "C", "D", "E", "F"],
+                sources=[],
+            )
+            self.save(vault, git_head(vault), include=["notes/tag-order.md"])
+            base = git_head(vault)
+            _payload, source_plan = self.collect_tags(
+                vault,
+                base,
+                output=root / "mapping-source.csv",
+            )
+            header, source_rows = read_tag_plan(source_plan)
+            source_by_tag = {row["tag"]: row for row in source_rows}
+
+            invalid_decisions = {
+                "cycle": {"A": ("rename", "B"), "B": ("rename", "A")},
+                "target-delete": {"A": ("rename", "B"), "B": ("delete", "")},
+                "self-rename": {"A": ("rename", "A")},
+            }
+            for name, decisions in invalid_decisions.items():
+                with self.subTest(case=name):
+                    rows = [dict(row) for row in source_rows]
+                    for row in rows:
+                        action, target = decisions.get(row["tag"], ("keep", ""))
+                        row["action"] = action
+                        row["target"] = target
+                    write_tag_plan(source_plan, rows, header=header)
+                    page_before = page.read_bytes()
+                    self.apply_tags(vault, base, source_plan, approved=True, expected=2)
+                    self.assertEqual(page.read_bytes(), page_before)
+                    self.assertEqual(git_status(vault), [])
+                    write_tag_plan(source_plan, source_rows, header=header)
+
+            valid_rows = [dict(source_by_tag[tag]) for tag in ("F", "E", "D", "C", "B", "a", "A")]
+            decisions = {
+                "A": ("rename", "Z"),
+                "a": ("rename", "Z"),
+                "B": ("rename", "Z"),
+                "C": ("rename", "D"),
+                "D": ("keep", ""),
+                "E": ("delete", ""),
+                "F": ("rename", tag_plan_cell("=canonical")),
+            }
+            for row in valid_rows:
+                row["action"], row["target"] = decisions[row["tag"]]
+            write_tag_plan(source_plan, valid_rows)
+            source_plan.write_bytes(
+                b"\xef\xbb\xbf" + source_plan.read_bytes().replace(b"\n", b"\r\n")
+            )
+            applied = self.apply_tags(vault, base, source_plan, approved=True)
+            self.assertEqual(applied.get("changed_paths"), ["notes/tag-order.md"], applied)
+            self.assertRegex(page.read_text(encoding="utf-8"), r'(?m)^tags: \["Z", "D", "=canonical"\]$')
+            self.assertNotRegex(page.read_text(encoding="utf-8"), r'(?m)^tags: \["D", "Z"')
+
+    def test_tag_apply_flows_through_context_save_and_audit_with_exact_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vault = self.init_vault(root)
+            page = write_page(
+                vault,
+                "notes/检索标签.md",
+                "检索标签",
+                "note",
+                summary="标签改变后由内存索引检索，再由 save 重建正式索引。",
+                aliases=[],
+                tags=["旧检索词"],
+                sources=[],
+            )
+            self.save(vault, git_head(vault), include=["notes/检索标签.md"])
+            base = git_head(vault)
+            index_before = (vault / "index.csv").read_bytes()
+            _payload, plan = self.collect_tags(vault, base)
+            self.assertEqual(plan.parent.resolve(), vault.resolve())
+            decide_tag(plan, "旧检索词", "rename", "新检索词")
+            reviewed_plan = plan.read_bytes()
+            applied = self.apply_tags(vault, base, plan, approved=True)
+            changed_paths = applied.get("changed_paths")
+            self.assertEqual(changed_paths, ["notes/检索标签.md"], applied)
+            self.assertIsInstance(changed_paths, list, applied)
+            assert isinstance(changed_paths, list)
+            self.assertEqual((vault / "index.csv").read_bytes(), index_before)
+
+            context = self.assert_exit(
+                run_cli(
+                    "context",
+                    "--plan",
+                    json.dumps({"required_tags": ["新检索词"]}, ensure_ascii=False),
+                    cwd=vault,
+                ),
+                0,
+            )
+            self.assertEqual(candidate_paths(context), ["notes/检索标签.md"])
+            self.assertIs(context.get("overlay"), True, context)
+            self.assertIn("index_warning", context)
+            drift = self.assert_exit(run_cli("audit", "--scope", "all", cwd=vault), 4)
+            self.assertTrue(any_nested_key(drift, "code", "E_INDEX_DRIFT"), drift)
+            self.assertEqual((vault / "index.csv").read_bytes(), index_before)
+
+            unrelated = vault / "私人草稿.txt"
+            unrelated.write_text("不要纳入标签检查点。\n", encoding="utf-8", newline="\n")
+            preview = self.save(
+                vault,
+                base,
+                operation="tag-maintenance",
+                include=changed_paths,
+                expected=5,
+            )
+            self.assertIs(preview.get("review_required"), True, preview)
+            self.assertEqual(git_head(vault), base)
+            self.assertEqual((vault / "index.csv").read_bytes(), index_before)
+            self.assertEqual(plan.read_bytes(), reviewed_plan)
+
+            saved = self.save(
+                vault,
+                base,
+                operation="tag-maintenance",
+                include=changed_paths,
+                approved=True,
+            )
+            self.assertIs(saved.get("saved"), True, saved)
+            self.assertEqual(plan.read_bytes(), reviewed_plan)
+            committed = run_git(
+                vault,
+                "-c",
+                "core.quotepath=false",
+                "diff",
+                "--name-only",
+                base,
+                "HEAD",
+                "--",
+            )
+            self.assertEqual(
+                set(str(committed.stdout).splitlines()),
+                {"index.csv", "notes/检索标签.md"},
+            )
+            self.assertTrue(unrelated.is_file())
+            visible_status = run_git(
+                vault,
+                "-c",
+                "core.quotepath=false",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            )
+            self.assertIn("私人草稿.txt", str(visible_status.stdout))
+            self.assertIn(plan.name, str(visible_status.stdout))
+            committed_plan = run_git(vault, "ls-tree", "--name-only", "HEAD", "--", plan.name)
+            self.assertEqual(str(committed_plan.stdout).strip(), "")
+            unrelated.unlink()
+            plan.unlink()
+            healthy = self.assert_exit(run_cli("audit", "--scope", "all", cwd=vault), 0)
+            self.assertIs(healthy.get("valid"), True, healthy)
+            self.assertEqual(git_status(vault), [])
+
+            new_base = git_head(vault)
+            _again_payload, again_plan = self.collect_tags(
+                vault,
+                new_base,
+                output=root / "after.csv",
+            )
+            _header, rows = read_tag_plan(again_plan)
+            self.assertEqual([row["tag"] for row in rows], ["新检索词"])
+            again = self.apply_tags(vault, new_base, again_plan, approved=True)
+            self.assertIs(again.get("changed"), False, again)
+            self.assertEqual(again.get("changed_paths"), [], again)
+            self.assertEqual(git_status(vault), [])
+
+    def test_regular_workflows_never_create_or_apply_a_tag_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vault = self.init_vault(root)
+            page = write_page(
+                vault,
+                "notes/普通维护.md",
+                "普通维护",
+                "note",
+                summary="普通工作流不得隐式运行标签维护。",
+                aliases=[],
+                tags=["散乱标签", "散乱标签"],
+                sources=[],
+            )
+            original = page.read_bytes()
+            self.save(vault, git_head(vault), operation="edit", include=["notes/普通维护.md"])
+            self.assertEqual(page.read_bytes(), original)
+            before = snapshot_files(vault)
+            self.assert_exit(run_cli("audit", "--scope", "all", cwd=vault), 0)
+            self.assert_exit(
+                run_cli(
+                    "context",
+                    "--plan",
+                    json.dumps({"required_tags": ["散乱标签"]}, ensure_ascii=False),
+                    cwd=vault,
+                ),
+                0,
+            )
+            self.assertEqual(snapshot_files(vault), before)
+            self.assertEqual(page.read_bytes(), original)
+            self.assertEqual(
+                sorted(path.name for path in vault.glob("*.csv")),
+                ["index.csv"],
+            )
 
 
 class IndexPipelineTests(WikiCliTestCase):
@@ -290,6 +1078,14 @@ class IndexPipelineTests(WikiCliTestCase):
             "block-mapping-list": (
                 "kind: note\nsummary: 摘要。\naliases:\n  - a: b\ntags: []\nsources: []",
                 "mapping",
+            ),
+            "block-inline-comment": (
+                "kind: note\nsummary: 摘要。\naliases: []\ntags:\n  - old # 用户注释\n  - other\nsources: []",
+                "comment",
+            ),
+            "inline-list-comment": (
+                "kind: note\nsummary: 摘要。\naliases: []\ntags: [old # 用户注释]\nsources: []",
+                "comment",
             ),
         }
         for name, (header, expected_text) in cases.items():

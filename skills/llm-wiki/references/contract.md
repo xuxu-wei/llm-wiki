@@ -40,6 +40,10 @@ vault 是独立 Git worktree 的根目录。其根目录包含 `AGENTS.md`、首
 
 运行时验证已知字段，同时保留未知 Properties 和正文。它可以为索引规范化列表值，但不会仅为调整字段顺序而重写 Markdown。
 
+页面 frontmatter 中的 `tags` 是标签语义的事实源。全库标签规范化只在用户明确触发并批准方案后执行；Python 不推断标签的同义关系、粒度或删除价值。
+
+`tags collect` 默认在 wiki 根目录生成未跟踪的 `tags-review-*.csv`，也可以显式输出到 vault 外的新文件，供 LLM 提案和用户修订。运行时以可逆前导 `'` 编码可能被电子表格解释为公式的标签单元格；该临时文件不属于持久 wiki，不进入索引或检查点，也不能取代或反向覆盖未获批准的页面元数据。确定性应用经批准的映射后，仍由 `save` 从页面文件头重建 `index.csv`。
+
 ## 生成的索引
 
 `index.csv` 由 Git 跟踪，但绝不手动编辑。其准确文件头为：
@@ -60,7 +64,7 @@ MOC 与索引并存：`index.csv` 用于机器召回，首页和其他 MOC 用�
 
 `audit --scope all` 对当前 HEAD 与工作树的结构、页面、链接、raw 和索引合同执行完整的只读健康检查；`audit --scope changed` 聚焦变更范围。
 
-`begin`、`add`、`context` 和 `save` 使用同一合同规则执行严格前置验证。`save` 可以从 Markdown 重建缺失的 `index.csv`，再用与独立 `audit` 相同的规则验证候选检查点。
+`begin`、`add`、`context`、`tags` 和 `save` 使用同一合同规则执行严格前置验证。`save` 可以从 Markdown 重建缺失的 `index.csv`，再用与独立 `audit` 相同的规则验证候选检查点。
 
 ## 原始文件与生命周期
 

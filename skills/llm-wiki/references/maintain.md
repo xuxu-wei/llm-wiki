@@ -23,6 +23,18 @@
 
 通过语义策展维护 MOC。MOC 是人工导航，不是 `index.csv` 的渲染结果。
 
+## 标签管理
+
+全库标签规范化只能由用户明确触发。创建或修改单个页面时可以维护该页标签，但不得顺带启动全库合并或删除。
+
+1. 运行 `begin`，先处理现有差异并取得干净的 base，再运行 `tags collect --base <base>`。Python 从所有可索引页面的 frontmatter 收集不同标签与页面数，默认在 wiki 根目录生成名为 `tags-review-*.csv`、固定字段为 `tag,page_count,action,target` 的临时 CSV；需要输出到 vault 外时使用 `--output <csv>`，且不得覆盖已有文件。
+2. LLM 审阅清单，保持 `tag` 和 `page_count` 不变，将每行 `action` 设为 `keep`、`rename` 或 `delete`，并只为 `rename` 填写 `target`。为避免电子表格执行公式型文本，Python 会给以 `'`、`=`、`+`、`-`、`@` 开头的标签增加一个可逆前导 `'`；LLM 必须保留该编码，并对同类 `target` 使用相同编码。遇到名称含义不明确时，使用带 `required_tags` 的 `context` 查询并打开必要的真实页面，不要把所有页面内容加入上下文。
+3. 让用户审阅并修订 CSV。得到明确确认前，只运行 `tags apply --base <base> --plan <csv>` 验证并预览，不得使用 `--approved` 写入。这里必须原样复用 collect 返回的 base，不能以更新后的 HEAD 替换。
+4. 用户确认后，以相同参数追加 `--approved`。默认计划文件可以是唯一额外的临时工作流文件，即使本地 ignore 规则隐藏它也不会被纳入 Git；Python 只执行 CSV 中的精确映射，拒绝其他可见状态漂移或不完整的方案，保留其他 Properties 和正文，并返回发生变化的页面路径。
+5. 核对实际 Git diff 与批准方案一致后，使用原始 base 和返回的页面路径运行 `save --base <base> --operation tag-maintenance --include <changed_paths...> --approved`，重建 `index.csv`、审计候选并形成检查点。明确纳入范围不得包含评审 CSV。
+
+临时 CSV 是提案和审批载体，不是 wiki 事实源，不进入索引或检查点。运行时不会自动删除它；完成检视后由用户决定继续保留、移出或删除。页面 frontmatter 中的 `tags` 始终是语义事实源。Python 不判断同义关系、标签粒度或应删除的标签；多对一重命名后只做确定性去重。
+
 ## 保存
 
 `save` 是审计后的受控写入，不是健康检查的别名。运行时传入原始基线、操作类型和明确纳入范围的路径。仅当相关 Markdown 发生变化或索引漂移时，运行时才会从页面文件头重建 `index.csv`，按字节比较结果，使用与独立 `audit` 相同的规则审计候选检查点，并让提交只包含纳入范围的路径及生成的索引。缺失的 `index.csv` 可以在此阶段从 Markdown 文件头重建，不应在重建前被结构检查阻断。
@@ -39,6 +51,7 @@
 - 重命名或删除页面；
 - 合并、拆分或大幅改写用户内容；
 - 更改 source/raw 或 source/source 关系；
+- 批量重命名或删除标签；
 - 解决语义冲突。
 
 绝不修改或移动已提交的 raw，不丢弃未经确认的工作，不暂存无关文件，也不允许 Python 编造 summary、tags、aliases、页面边界或证据结论。
