@@ -297,7 +297,7 @@ class SkillPackageAcceptanceTests(unittest.TestCase):
         self.assertRegex(note, r"(?m)^sources:")
 
         attributes = (SKILL_DIR / "templates" / ".gitattributes").read_text(encoding="utf-8")
-        self.assertRegex(attributes, r"(?m)^raw/\*\*.*(?:-text|binary)")
+        self.assertRegex(attributes, r"(?m)^raw/\*\*\s+-text\s+-diff\s+-eol\s*$")
         ignore = (SKILL_DIR / "templates" / ".gitignore").read_text(encoding="utf-8")
         self.assertIn(".obsidian/", ignore)
 

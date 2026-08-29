@@ -761,6 +761,59 @@ class RawIngestTests(WikiCliTestCase):
             source_row = next(row for row in rows if row["path"] == source_rel)
             self.assertEqual(source_row["summary"], "检索研究的证据范围与限制。")
 
+    def test_raw_markdown_preserves_crlf_bytes_through_save_and_clone(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vault = self.init_vault(root)
+            material = root / "译文.md"
+            original = b"\xef\xbb\xbf# Translation\r\n\r\nFirst line.\r\nSecond line.\r\n"
+            material.write_bytes(original)
+            attributes = run_git(
+                vault,
+                "check-attr",
+                "text",
+                "diff",
+                "eol",
+                "--",
+                "raw/译文来源/译文.md",
+            )
+            self.assertIn("text: unset", str(attributes.stdout))
+            self.assertIn("diff: unset", str(attributes.stdout))
+            self.assertIn("eol: unset", str(attributes.stdout))
+
+            base = git_head(vault)
+            added = self.assert_exit(
+                run_cli(
+                    "add",
+                    str(material),
+                    "--base",
+                    base,
+                    "--name",
+                    "译文来源",
+                    cwd=vault,
+                ),
+                0,
+            )
+            source_rel = str(added["source"])
+            raw_rel = str(added["raw"][0]["path"])  # type: ignore[index]
+            set_frontmatter_scalar(vault / source_rel, "summary", "保留原始换行的译文来源。")
+
+            saved = self.save(
+                vault,
+                base,
+                operation="ingest",
+                include=[source_rel, raw_rel],
+            )
+            self.assertIs(saved.get("saved"), True, saved)
+            self.assertEqual((vault / raw_rel).read_bytes(), original)
+            self.assertEqual(git_show_bytes(vault, f"HEAD:{raw_rel}"), original)
+            self.assert_exit(run_cli("audit", "--scope", "all", cwd=vault), 0)
+
+            clone = root / "clone"
+            run_git(root, "clone", "--quiet", str(vault), str(clone))
+            self.assertEqual((clone / raw_rel).read_bytes(), original)
+            self.assertEqual(git_status(clone), [])
+
     def test_exact_duplicate_reuses_the_committed_raw_and_source(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

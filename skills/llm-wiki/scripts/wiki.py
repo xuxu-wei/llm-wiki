@@ -1295,13 +1295,13 @@ def audit_findings(
         try:
             validate_discovered_path(vault, attributes_path, label="Git attributes file")
             if attributes_path.is_file() and not re.search(
-                r"(?m)^raw/\*\*\s+-text\s+-diff\s*$", read_text(attributes_path)
+                r"(?m)^raw/\*\*\s+-text\s+-diff\s+-eol\s*$", read_text(attributes_path)
             ):
                 findings.append(
                     finding(
                         "E_RAW_ATTRIBUTES",
                         ".gitattributes",
-                        "raw/** must disable text conversion and diff drivers",
+                        "raw/** must disable text conversion, diff drivers, and inherited eol",
                     )
                 )
         except WikiError as exc:

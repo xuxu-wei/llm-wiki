@@ -309,6 +309,32 @@ class AuditHealthRegressionTests(WikiCliTestCase):
 
 
 class RawVersionRegressionTests(WikiCliTestCase):
+    def test_old_raw_attribute_rule_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            vault = self.init_vault(Path(temp_dir))
+            base = git_head(vault)
+            attributes = vault / ".gitattributes"
+            attributes.write_text(
+                attributes.read_text(encoding="utf-8").replace(
+                    "raw/** -text -diff -eol",
+                    "raw/** -text -diff",
+                ),
+                encoding="utf-8",
+                newline="\n",
+            )
+
+            audit = self.assert_exit(run_cli("audit", "--scope", "changed", cwd=vault), 4)
+            self.assertIn("E_RAW_ATTRIBUTES", finding_codes(audit))
+            saved = self.save(
+                vault,
+                base,
+                operation="edit",
+                include=[".gitattributes"],
+                expected=4,
+            )
+            self.assertIs(saved.get("saved"), False, saved)
+            self.assertEqual(git_head(vault), base)
+
     def test_add_new_raw_version_updates_existing_source_as_a_reviewed_pending_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
