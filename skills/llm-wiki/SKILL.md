@@ -24,7 +24,7 @@ Markdown 页面是语义事实来源。`index.csv` 从页面文件头生成。�
 - **理解或修改 vault 结构规范：**阅读[合同](references/contract.md)。
 - **创建 wiki：**阅读[创建](references/create.md)和[合同](references/contract.md)。
 - **摄入证据或记录用户思考：**阅读[摄入](references/ingest.md)。涉及原生文档、外部研究、内容提取或证据质量判断时，另读[工具与研究](references/tools-and-research.md)。
-- **查询、联系或综合已有知识：**阅读[查询](references/query.md)。普通查询不要加载完整合同。
+- **查询、联系或综合已有知识：**阅读[查询](references/query.md)。普通查询不要加载完整合同。创建、扩展或重构整合多个来源的持久 note 时，另读并使用[笔记模板](templates/note.md)。
 - **审计、修复、标签规范化、重命名、重组或保存检查点：**阅读[维护](references/maintain.md)。仅在修复结构规范时追加阅读合同。
 - **处理 Obsidian 专属编辑、Properties、附件、MOC 或 Graph 视图行为：**阅读[Obsidian](references/obsidian.md)。
 

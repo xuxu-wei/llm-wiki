@@ -405,11 +405,14 @@ skills/llm-wiki/
 
 `SKILL.md` 只保留技能触发条件、各层职责、任务路由、写入安全边界以及参考文档加载条件。详细结构、工作流和命令行为放入对应参考文档。
 
+`note.md` 同时提供整合多个来源的持久笔记所需的页面结构和写作提示，`SKILL.md` 只负责按任务导航。
+
 任务路由：
 
 - 创建 wiki 时读取 `create.md` 和 `contract.md`；
 - 摄入证据或记录用户思考时读取 `ingest.md`，需要专业格式读取或外部研究时追加 `tools-and-research.md`；
 - 查询和综合已有知识时读取 `query.md`；
+- 创建、扩展或重构整合多个来源的持久 note 时，另读并使用 `note.md`；
 - 审计、修复、重命名、重组或保存检查点时读取 `maintain.md`，仅在修复结构时追加 `contract.md`；
 - 处理 Obsidian 专属编辑、Properties、附件、MOC 或 Graph 行为时读取 `obsidian.md`。
 

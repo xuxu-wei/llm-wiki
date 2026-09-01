@@ -303,6 +303,47 @@ class SkillPackageAcceptanceTests(unittest.TestCase):
         ignore = (SKILL_DIR / "templates" / ".gitignore").read_text(encoding="utf-8")
         self.assertIn(".obsidian/", ignore)
 
+    def test_cross_source_notes_route_to_the_guiding_template(self) -> None:
+        skill_text = SKILL_PATH.read_text(encoding="utf-8")
+        self.assertRegex(
+            skill_text,
+            r"整合多个来源的持久 note[^\n]*\[笔记模板\]\(templates/note\.md\)",
+        )
+
+        note = (SKILL_DIR / "templates" / "note.md").read_text(encoding="utf-8")
+        expected_frontmatter = "\n".join(
+            (
+                "---",
+                "kind: note",
+                'summary: "{{summary}}"',
+                "aliases: []",
+                "tags: []",
+                "sources: []",
+                "---",
+            )
+        )
+        self.assertTrue(note.startswith(expected_frontmatter + "\n"))
+        self.assertRegex(note, r"(?m)^> \[!summary\] 当前综合$")
+        self.assertEqual(
+            re.findall(r"(?m)^## (.+)$", note),
+            [
+                "题旨与范围",
+                "结构化知识地图",
+                "关键关系、张力与竞争解释",
+                "与相邻 notes 的分工",
+            ],
+        )
+        comments = "\n".join(re.findall(r"<!--(.*?)-->", note, re.DOTALL))
+        rendered_note = re.sub(r"<!--.*?-->", "", note, flags=re.DOTALL)
+        for optional_section in ("待验证问题", "前瞻性科学问题", "可检验假设"):
+            self.assertIn(optional_section, comments)
+            self.assertNotIn(optional_section, rendered_note)
+        for boundary in ("不逐篇追加来源摘要", "不以论文名称作为主要维度"):
+            self.assertIn(boundary, note)
+        for rejected_term in ("发现引擎", "分歧资产", "宣传性表达"):
+            self.assertIn(rejected_term, comments)
+            self.assertNotIn(rejected_term, rendered_note)
+
     def test_ingest_keeps_a_linked_material_bundle_in_one_source(self) -> None:
         ingest = (SKILL_DIR / "references" / "ingest.md").read_text(encoding="utf-8")
         for phrase in (
