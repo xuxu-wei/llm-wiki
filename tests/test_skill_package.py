@@ -300,8 +300,10 @@ class SkillPackageAcceptanceTests(unittest.TestCase):
 
         attributes = (SKILL_DIR / "templates" / ".gitattributes").read_text(encoding="utf-8")
         self.assertRegex(attributes, r"(?m)^raw/\*\*\s+-text\s+-diff\s+-eol\s*$")
+        self.assertRegex(attributes, r"(?m)^tags-review\.csv\s+text\s+eol=lf\s*$")
         ignore = (SKILL_DIR / "templates" / ".gitignore").read_text(encoding="utf-8")
         self.assertIn(".obsidian/", ignore)
+        self.assertRegex(ignore, r"(?m)^/tags-review-\*\.csv$")
 
     def test_cross_source_notes_route_to_the_guiding_template(self) -> None:
         skill_text = SKILL_PATH.read_text(encoding="utf-8")
@@ -343,6 +345,29 @@ class SkillPackageAcceptanceTests(unittest.TestCase):
         for rejected_term in ("发现引擎", "分歧资产", "宣传性表达"):
             self.assertIn(rejected_term, comments)
             self.assertNotIn(rejected_term, rendered_note)
+
+    def test_persistent_tag_policy_is_routed_without_an_extra_reference(self) -> None:
+        skill = SKILL_PATH.read_text(encoding="utf-8")
+        maintain = (SKILL_DIR / "references" / "maintain.md").read_text(encoding="utf-8")
+        contract = (SKILL_DIR / "references" / "contract.md").read_text(encoding="utf-8")
+        agents = (SKILL_DIR / "templates" / "AGENTS-for-wiki.md").read_text(encoding="utf-8")
+        self.assertIn("tags vocabulary", skill)
+        self.assertIn("tags check", skill)
+        self.assertIn("references/maintain.md", skill)
+        for phrase in (
+            "tags-review.csv",
+            "tags collect",
+            "tags apply",
+            "tags merge",
+            "tag-policy",
+            "amendments",
+        ):
+            self.assertIn(phrase, maintain)
+        self.assertIn("当前标签事实源", contract)
+        self.assertIn("跨轮次人工决策账本", contract)
+        self.assertIn("tags-review.csv", agents)
+        self.assertIn("tags vocabulary", agents)
+        self.assertIn("tags check", agents)
 
     def test_ingest_keeps_a_linked_material_bundle_in_one_source(self) -> None:
         ingest = (SKILL_DIR / "references" / "ingest.md").read_text(encoding="utf-8")
@@ -430,11 +455,14 @@ class SkillPackageAcceptanceTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(tag_help.returncode, 0, tag_help.stderr)
-        for term in ("tag", "collect", "apply", "review"):
+        for term in ("tag", "collect", "apply", "vocabulary", "check", "merge", "review"):
             self.assertIn(term, tag_help.stdout.lower())
         tag_subcommands = {
+            "vocabulary": (),
+            "check": ("--tags-json",),
             "collect": ("--base", "--output"),
-            "apply": ("--base", "--plan", "--approved"),
+            "apply": ("--base", "--plan", "--amendments", "--approved"),
+            "merge": ("--base", "--plan", "--amendments", "--approved"),
         }
         for subcommand, arguments in tag_subcommands.items():
             with self.subTest(command=f"tags {subcommand}"):
@@ -475,7 +503,7 @@ class SkillPackageAcceptanceTests(unittest.TestCase):
         self.assertEqual(undocumented, [], "every public CLI argument must have non-empty help")
         self.assertEqual(
             public_commands,
-            {*expectations, "tags", "collect", "apply"},
+            {*expectations, "tags", *tag_subcommands},
             "the public parser surface must match the documented commands",
         )
 

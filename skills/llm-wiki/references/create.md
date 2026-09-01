@@ -15,7 +15,7 @@
 
 5. 检查 JSON 结果以及初始 Git 差异或检查点。
 
-初始化必须创建独立的 Git worktree，其中包含 `AGENTS.md`、首页 MOC、`index.csv`、`inbox/`、`raw/`、`sources/`、`notes/`、`assets/`、`.gitattributes` 和 `.gitignore`。遇到冲突时应保留已有用户文件和 Git 配置，不得强制完成初始化。
+初始化必须创建独立的 Git worktree，其中包含 `AGENTS.md`、首页 MOC、`index.csv`、空的 `tags-review.csv`、`inbox/`、`raw/`、`sources/`、`notes/`、`assets/`、`.gitattributes` 和 `.gitignore`。`tags-review.csv` 只包含 `tag,page_count,action,target` 表头，使用 UTF-8 BOM 和 LF。遇到冲突时应保留已有用户文件和 Git 配置，不得强制完成初始化。
 
 初始化会创建 `AGENTS.md`；如果已有智能体合同与之冲突，应拒绝继续，不得静默替换或改写。
 
@@ -26,6 +26,7 @@
 - vault 根目录就是 Git worktree 根目录；
 - 初始检查点干净且可恢复；
 - 首页是有效的 `moc`，并出现在 `index.csv` 中；
+- 空的 `tags-review.csv` 已被 Git 跟踪，临时 `tags-review-*.csv` 被忽略；
 - `raw/**` 不进行文本转换；
 - `.obsidian/` 被忽略，而 wiki 内容仍由 Git 跟踪；
 - vault 可以在 Obsidian 或其他编辑器中作为普通 Markdown 打开。

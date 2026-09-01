@@ -27,6 +27,7 @@ LLM Wiki 把工作交给最适合的一层：
 6. 公共运行时支持 Python 3.10+，且仅使用标准库。
 7. 核心格式不依赖 Obsidian，但默认围绕 Obsidian 的使用体验设计。
 8. PDF 解析、OCR、电子表格分析和网页读取复用专业工具，不进入核心运行时。
+9. 标签事实保存在 Markdown；跨轮次人工决策保存在 Git 跟踪的 `tags-review.csv`，两者不得互相冒充。
 
 本文规定产品行为、公共数据合同和可观察结果。标准库调用方式、异常分支、临时文件和 Git 内部步骤由实现与单元测试决定。
 
@@ -56,6 +57,8 @@ LLM 阅读材料后撰写来源页，说明来源是什么、能够支持什么�
 5. 涉及合并、删除或大幅改写用户文字时先让用户审阅。
 
 未经证实的思考可以保留，但不得伪装成有来源支持的结论。
+
+拟定标签前，LLM 先读取 Python 从人工决策账本生成的首选、禁用和重命名策略，优先复用已有规范标签。只有首选词表不能充分描述材料时才提出新标签，写入前再由 Python 检查。
 
 ### 2.3 LLM 阅读、联系与综合
 
@@ -99,6 +102,7 @@ LLM 只复核发生语义变化的页面及必要的直接邻居。用户可以�
 ├── AGENTS.md
 ├── 首页.md
 ├── index.csv
+├── tags-review.csv
 ├── inbox/
 ├── raw/
 ├── sources/
@@ -122,6 +126,7 @@ Python 使用标准路径接口把输入统一为 vault 内的相对路径；无
 | `inbox/` | 用户尚未整理的想法、摘记、问题和临时输入 | 是 |
 | `assets/` | 为页面展示服务的附件，如示意图、截图和导出图表 | 否 |
 | 首页与 MOC | 人工策展的主题入口和导航 | 是 |
+| `tags-review.csv` | 跨轮次保留的人工标签决策账本 | 否 |
 
 `raw/` 保存证据文件，`sources/` 让证据成为可查找、可链接、可评价的知识节点。一个来源页可以引用一个或多个 raw 文件。网页、粘贴文本和口述记录在可行时也应固化到 raw；无法固化时，来源页必须保留访问方式并说明证据限制。
 
@@ -151,7 +156,7 @@ Python 使用标准路径接口把输入统一为 vault 内的相对路径；无
 
 Python 结构化读取已知字段，保留未知 Obsidian 属性和正文。已知字段无法解析或不符合合同时阻止保存，并指出页面与字段；运行时不得猜测含义或静默重写用户正文。
 
-Python 在生成 `index.csv` 时规范化列表值；LLM 决定哪些 `aliases` 和 `tags` 在语义上合适。
+Python 在生成 `index.csv` 时规范化列表值；LLM 决定哪些 `aliases` 和 `tags` 在语义上合适。拟写标签前，Python 从 `tags-review.csv` 返回首选标签、禁用标签和重命名映射；LLM 先复用合适的首选标签，只在词表不足时提出新标签，并在写入前调用确定性检查。
 
 ### 3.4 命名与链接
 
@@ -248,17 +253,29 @@ Git 指出哪些文档发生变化，LLM 判断 `summary`、`aliases` 和 `tags`
 
 ### 5.4 标签规范化
 
-全库标签规范化是用户手动触发的维护流程，不由页面创建、`audit` 或 `save` 自动启动。页面 frontmatter 中的 `tags` 始终是事实源，不建立持久标签注册表。
+标签系统分为三层：页面 frontmatter 中的 `tags` 是当前事实源，根目录 `tags-review.csv` 是跨轮次人工决策账本，`tags-review-<random>.csv` 是单轮维护的临时提案。`index.csv` 只从页面生成；策略账本不是当前标签清单，也不记录页面路径。
 
-流程使用同一份临时 CSV。默认文件名为 `tags-review-<random>.csv`，直接生成在 wiki 根目录；显式 `--output` 只能指定 vault 外的新文件。
+`tags-review.csv` 与临时表使用固定字段 `tag,page_count,action,target`。账本的 `page_count` 是该标签最后一次进入审阅时的页面数，不是实时计数。新 vault 初始化空账本；既有 vault 首次合并策略时创建。一旦账本进入 HEAD，受支持的流程不得删除它。
 
-1. 从干净的 base 运行 `tags collect`。Python 扫描全部可索引页面的文件头，以稳定顺序生成 `tag,page_count,action,target`；每个不同标签一行，初始 `action` 为 `keep`，`target` 为空。可能触发电子表格公式解析的标签单元格使用可逆前导 `'` 编码。
-2. LLM 把 `action` 调整为 `keep`、`rename` 或 `delete`，只为 `rename` 填写 `target`。名称含义不明确时，通过带 `required_tags` 的 QueryPlan 查询相关页面并阅读真实 Markdown。
-3. 用户审阅并修订 CSV。未经用户明确批准，Python 只验证和预览方案，不修改页面。
-4. Python 在 base 和页面状态未变化时应用已批准方案。默认根级计划文件可以是唯一额外的临时工作流文件；其他 dirty、staged 或 untracked 状态都使操作失败。应用只修改相关页面的 `tags`，多对一映射按首次出现顺序去重，未知 Properties、其他元数据和正文保持不变。
-5. 现有 `save` 只接收受影响页面路径，重建 `index.csv`、审计并创建检查点。计划文件保持未跟踪，不自动删除。
+日常页面标签流程为：
 
-临时 CSV 只是 LLM 提案与人工审批的载体，不属于持久 wiki，不进入索引或检查点。Python 拒绝缺行、重复行、未知动作、非法目标或已过期的方案，不自行选择规范名称或删除标签。保存后文件仍保留在原位置；它可能依本地 ignore 规则显示为未跟踪或被忽略，由用户决定继续保留、移出或删除。
+1. `tags vocabulary` 从 keep 标签和 rename 最终目标生成 `preferred_tags`，从 delete 标签和 rename 源生成 `forbidden_tags`，并返回 `rename_map`。
+2. LLM 优先使用首选词表，不生成禁用标签。只有词表不能较完整描述材料时才提出新标签。
+3. 写入前运行 `tags check --tags-json <JSON>`。被禁用或可以重命名的标签必须修正，未知但合法的新标签被报告并留待后续人工维护。
+
+全库标签规范化只由用户明确触发，并形成页面和策略两个分离的检查点：
+
+1. 在干净页面基线 B0 上运行 `tags collect`。Python 扫描全部可索引文件头，在 wiki 根目录生成被忽略的临时 CSV；显式 `--output` 只能指定 vault 外的新文件。
+2. 当前已有历史决策的标签继承 `action/target`，当前出现的历史 rename 目标预填 keep，真正的新标签保持未决。LLM 只修改 `action` 和 `target`，用户审阅并确认。
+3. 若当前决定会与未出现在本轮清单中的历史 rename 源形成链，用户另行审阅 amendments。补丁只能覆盖账本已有且未出现在当前 plan 的标签，保持历史 `page_count`，并直接改到最终目标。
+4. `tags apply` 联合验证 plan、amendments、B0 和当前页面状态；未批准时只预览，批准后只修改受影响页面的顶层 `tags`。多对一映射按首次出现顺序去重，其他 Properties、BOM、换行和正文保持不变。
+5. 实际页面 diff 与批准方案一致后，`save --operation tag-maintenance` 只保存页面和生成的 `index.csv`，得到 B1。没有页面变化时不创建空检查点。
+6. 在干净 B1 上由 `tags merge` 预览并原子更新账本。本轮记录覆盖或新增，未在本轮出现的历史记录及其计数原样保留。
+7. `save --operation tag-policy` 只保存 `tags-review.csv`。两个实际需要的检查点都成功后，才可删除临时 plan 和 amendments。
+
+CSV 输出使用 UTF-8 BOM 和 LF，输入兼容 UTF-8 BOM、CRLF 和任意行序。可能触发电子表格公式解析的单元格使用可逆前导 `'`。Python 在首次写入前联合拒绝未决 action、非法 target、遗漏或重复、目标被 delete、自重命名、rename 链或环、NFC/casefold 冲突以及非规范公式单元格；允许多个旧标签指向同一最终标签，但不自动展开链或替用户消解冲突。
+
+临时 CSV 不属于持久 wiki，不进入索引或 Git 检查点，运行时也不自动删除。普通页面维护、`audit` 和 `save` 不自动启动全库标签规范化。
 
 ## 6. 检索合同
 
@@ -351,8 +368,11 @@ python scripts/wiki.py <command> --help
 | `begin` | 当前 vault | 返回基线、dirty 状态和需要先处理的人类或 LLM 变更 |
 | `add INPUT... --base OID --name PAGE_NAME` | 材料、基线和 Unicode 页面名 | 安装 raw，创建或更新来源草稿，报告重复与冲突 |
 | `context --plan JSON` | LLM 生成的 QueryPlan | 返回候选 JSON，可通过 `limit` 限制数量，必要时请求全文回退 |
-| `tags collect --base OID [--output CSV]` | 干净基线和可选的 vault 外新文件 | 默认在根目录生成唯一标签评审表并返回其路径 |
-| `tags apply --base OID --plan CSV [--approved]` | 同一基线和完整评审表 | 未批准时验证并预览；批准后只更新页面标签并返回变化路径 |
+| `tags vocabulary` | 当前策略账本 | 只读返回首选标签、禁用标签和重命名映射 |
+| `tags check --tags-json JSON` | 拟写入页面的标签数组 | 只读返回接受、新增、拒绝及替换建议 |
+| `tags collect --base OID [--output CSV]` | 干净页面基线和可选的 vault 外新文件 | 默认在根目录生成继承历史决策的临时评审表 |
+| `tags apply --base OID --plan CSV [--amendments CSV] [--approved]` | 页面基线和完整人工方案 | 联合验证并预览；批准后只更新页面标签 |
+| `tags merge --base OID --plan CSV [--amendments CSV] [--approved]` | 页面检查点和同一人工方案 | 预览或原子更新持久策略账本 |
 | `audit [--scope changed\|all]` | 当前 wiki | `all` 完整检查仓库健康，`changed` 聚焦变化范围 |
 | `save --base OID --operation KIND --include PATH... [--approved]` | 本次明确变更 | 重建索引、审计，并在满足风险规则后创建检查点 |
 
@@ -365,8 +385,11 @@ CLI 面向 LLM 的正常输出为 JSON。错误必须指出操作、文件和可
 - `add` 不覆盖已有 raw 或页面；
 - `add` 返回待处理状态，不代表工作流已经完成；
 - `context` 与 `audit` 不写文件；
-- `tags collect` 要求写入前工作树完全干净；省略 `--output` 时只在 wiki 根目录创建未跟踪的 `tags-review-<random>.csv`，显式输出必须位于 vault 外且不能覆盖已有文件，不修改 Git 暂存区或 HEAD；
-- `tags apply` 要求调用者原样复用 collect 返回的 base，且页面状态仍然有效；只允许传入的默认根级计划作为唯一额外临时文件，无论本地 ignore 规则是否隐藏它；未提供 `--approved` 时返回退出码 `5` 且不写页面，批准后也不改动计划文件、不重建索引或提交；
+- `tags vocabulary` 和 `tags check` 只读；未知标签可以作为 `new_tags` 返回，禁用标签必须在写入前修正；
+- `tags collect` 要求写入前工作树完全干净；省略 `--output` 时只在 wiki 根目录创建被忽略的 `tags-review-<random>.csv`，显式输出必须位于 vault 外且不能覆盖已有文件，不修改 Git 暂存区或 HEAD；
+- `tags apply` 要求调用者原样复用 collect 返回的页面基线，且页面状态仍然有效；未提供 `--approved` 时返回退出码 `5` 且不写页面，批准后也不改动计划、策略账本、索引或 HEAD；
+- `tags merge` 要求页面应用已形成精确检查点且工作树干净；未提供 `--approved` 时返回退出码 `5` 且不写账本，批准后只原子更新 `tags-review.csv`；
+- `tag-maintenance` 与 `tag-policy` 都是高风险保存操作；前者只保存页面和生成的索引，后者只保存策略账本；
 - `audit` 只要求当前目录可以定位为 Git worktree 根；结构损坏时尽量返回完整 findings；
 - `begin`、`add`、`context`、`tags` 和 `save` 严格拒绝不满足仓库合同的 wiki；
 - `save` 与独立 `audit` 使用同一审计规则，并允许在审计候选检查点前重建缺失的 `index.csv`；
@@ -448,7 +471,7 @@ skills/llm-wiki/
 
 - 实现 `init`、`begin`、`add`、`context`、`tags`、`audit` 和 `save`；
 - 实现未提交变化的只读检索视图；
-- 实现标签清单、人工评审方案和确定性应用流程；
+- 实现标签词表、写前检查、继承历史决策的人工评审、确定性应用和策略合并流程；
 - 实现常规与需审阅的 Git 检查点；
 - 建立端到端测试样例。
 
@@ -474,6 +497,7 @@ skills/llm-wiki/
 - 中文和其他 Unicode 文件名、Properties、wikilinks、backlinks 和 Graph 可以正常使用。
 - 无效页面阻止保存并指出页面和字段，不改写未知属性或用户正文。
 - raw、来源页、笔记、收件箱、展示附件和 MOC 的职责在模板与行为中一致。
+- 新建 vault 跟踪空的 `tags-review.csv`，既有 vault 可以在首次批准的策略合并时建立账本。
 
 ### 11.2 索引
 
@@ -511,6 +535,7 @@ skills/llm-wiki/
 - 普通非 wiki Git 仓库执行 `audit` 时只读报告健康问题；不能定位为 Git worktree 根时报告调用错误。
 - JSON、text 和 CSV 审计输出都保持有效，健康检查不自动修复文件，也不扫描全部 Git 祖先中的 raw 历史。
 - `save` 在 `index.csv` 缺失时能够先从 Markdown 重建索引，再使用同一规则完成候选检查点审计。
+- `tags-review.csv` 存在时，完整审计验证其结构和策略一致性；已被 HEAD 跟踪的账本不能通过受支持流程删除。
 
 ### 11.6 Obsidian 与协作
 
@@ -549,13 +574,16 @@ python skills/llm-wiki/scripts/wiki.py --help
 3. 用户在 Obsidian 中修改并重命名页面；系统先形成人工编辑检查点，再继续 LLM 工作。
 4. 用户用自然语言跨来源页与笔记查询；系统通过索引候选、链接扩展和必要的 raw 核对回答。
 5. 索引被删除或手工修改后，`audit` 发现漂移，`save` 从 Markdown 文件头确定性重建，并在重复运行时保持字节不变。
-6. 用户明确要求规范标签；系统默认在 wiki 根目录生成未跟踪评审表，LLM 提案，用户修订并批准，Python 更新页面，`save` 排除评审表、重建索引并形成检查点。
+6. 用户明确要求规范标签；系统在根目录生成继承历史决策的临时评审表，LLM 处理新标签，用户修订并批准，Python 更新页面后分别保存页面与索引检查点、策略账本检查点。
 
 ### 11.9 标签管理
 
 - 普通页面维护、`audit` 和 `save` 不会自动启动全库标签规范化。
-- `tags collect` 为每个现有标签生成一行稳定的 `tag,page_count,action,target`；除默认创建根级未跟踪评审表外，不改变页面、HEAD、暂存区或 `index.csv`，也不把临时 CSV 加入 Git。
-- 中文以及包含逗号、引号或 `/` 的标签能够在 CSV 中无损往返；空标签集合只生成表头并报告无需应用。
-- LLM 可以提出保留、重命名或删除方案；歧义项通过 `required_tags` 查询有限页面，提案阶段不修改 wiki。
-- 未批准、缺行、重复、非法或已过期的方案不写文件；用户批准后只修改受影响页面的 `tags`，多对一结果去重并保留其他 Properties 和正文。
-- `tags apply` 返回的页面可以由现有 `save` 精确纳入；保存后 `index.csv` 与页面 frontmatter 一致，临时评审表不进入检查点、不被自动删除，并继续留在原位置。
+- `tags vocabulary` 稳定返回 keep 标签和 rename 目标组成的首选词表、delete 标签和 rename 源组成的禁用词表以及 rename 映射；`tags check` 在页面写入前报告新标签并拒绝禁用标签。
+- `tags collect` 为当前每个标签生成一行 `tag,page_count,action,target`，继承已有决策并把真正的新标签留空；除创建根级被忽略的临时表外，不改变页面、HEAD、暂存区、`index.csv` 或账本。
+- 中文以及包含逗号、引号或 `/` 的标签能够在 UTF-8 BOM CSV 中无损往返；空标签集合只生成表头。
+- LLM 只为未决项提出保留、重命名或删除方案；歧义项通过 `required_tags` 查询有限页面，用户审阅前不修改 wiki。
+- plan 与 amendments 联合拒绝缺行、重复、未决或非法动作、目标被删除、自重命名、rename 链或环、NFC/casefold 冲突和非规范公式单元格；amendments 不能新增标签、与 plan 重叠或改变历史 `page_count`。
+- `tags apply` 经批准后只修改实际受影响页面的顶层 `tags`，多对一结果去重并逐字节保留其他 Properties 和正文；页面检查点只包含这些页面和生成的 `index.csv`。
+- `tags merge` 保留本轮未出现的全部历史记录，覆盖或新增本轮决策；未批准、陈旧状态或写入前发现的并发变化均零写入，极晚发生的写后竞态保留可见差异并返回冲突。策略检查点只包含 `tags-review.csv`。
+- 临时 plan 和 amendments 不进入检查点、不被自动删除，并且只有两个实际需要的检查点均成功后才可清理。

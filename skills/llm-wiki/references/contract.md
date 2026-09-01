@@ -4,7 +4,7 @@
 
 ## 知识库结构
 
-vault 是独立 Git worktree 的根目录。其根目录包含 `AGENTS.md`、首页 Markdown、`index.csv`、`inbox/`、`raw/`、`sources/`、`notes/`、`assets/`、`.gitattributes` 和 `.gitignore`。
+vault 是独立 Git worktree 的根目录。新建 vault 的根目录包含 `AGENTS.md`、首页 Markdown、`index.csv`、`tags-review.csv`、`inbox/`、`raw/`、`sources/`、`notes/`、`assets/`、`.gitattributes` 和 `.gitignore`。既有 vault 可以在首次标签策略合并时创建 `tags-review.csv`；一旦该文件进入 HEAD，受支持的工作流不得删除它。
 
 允许使用子目录。运行时将路径规范化为 vault 相对路径，并拒绝 vault 外路径或发生冲突的路径。
 
@@ -16,6 +16,7 @@ vault 是独立 Git worktree 的根目录。其根目录包含 `AGENTS.md`、首
 | `inbox/` | 尚未整理的用户思考和摘录 | 是 |
 | `assets/` | 图表、截图和导出图形等展示附件 | 否 |
 | 首页 | 供人类导航的根 MOC | 是 |
+| `tags-review.csv` | 跨轮次保留的人工标签决策 | 否 |
 
 证据文件应放入 `raw/`，即使页面中也会展示该文件。`assets/` 用于呈现。一个来源卡片可以对应一个或多个 raw 文件；其他页面引用来源卡片。
 
@@ -40,9 +41,13 @@ vault 是独立 Git worktree 的根目录。其根目录包含 `AGENTS.md`、首
 
 运行时验证已知字段，同时保留未知 Properties 和正文。它可以为索引规范化列表值，但不会仅为调整字段顺序而重写 Markdown。
 
-页面 frontmatter 中的 `tags` 是标签语义的事实源。全库标签规范化只在用户明确触发并批准方案后执行；Python 不推断标签的同义关系、粒度或删除价值。
+页面 frontmatter 中的 `tags` 是当前标签事实源。`index.csv` 是从页面生成的检索视图。根目录 `tags-review.csv` 是跨轮次人工决策账本，不代表当前标签清单；其固定字段为 `tag,page_count,action,target`，`page_count` 记录该标签最后一次进入审阅时的页面数。
 
-`tags collect` 默认在 wiki 根目录生成未跟踪的 `tags-review-*.csv`，也可以显式输出到 vault 外的新文件，供 LLM 提案和用户修订。运行时以可逆前导 `'` 编码可能被电子表格解释为公式的标签单元格；该临时文件不属于持久 wiki，不进入索引或检查点，也不能取代或反向覆盖未获批准的页面元数据。确定性应用经批准的映射后，仍由 `save` 从页面文件头重建 `index.csv`。
+账本中的 `keep` 保留标签，`delete` 禁止再次生成该标签，`rename` 禁止使用源标签并给出最终目标。Python 从 keep 标签和 rename 目标生成 `preferred_tags`，从 delete 标签和 rename 源生成 `forbidden_tags`，但不判断同义关系、粒度或新标签是否在语义上必要。创建或修改页面标签前，LLM 必须读取该词表，优先复用首选标签，并在写入前通过确定性检查。
+
+全库标签规范化只在用户明确触发并批准方案后执行。`tags collect` 默认在 wiki 根目录生成被忽略的 `tags-review-<random>.csv`，也可以显式输出到 vault 外的新文件；临时表继承已有决策，真正的新标签留待人工审阅。可选 amendments 只能修订当前清单之外的历史记录。运行时以可逆前导 `'` 编码可能被电子表格解释为公式的单元格；临时文件不属于持久 wiki，不进入索引或检查点。
+
+页面标签和生成的 `index.csv` 先形成检查点，随后把本轮决策覆盖或新增到 `tags-review.csv`，并单独形成策略检查点。未在本轮出现的历史记录不得删减，amendments 必须保留历史 `page_count`。运行时联合拒绝 rename 链、环、自重命名、目标被删除、NFC/casefold 冲突和未决或非法方案，不自动展平或替用户消解冲突。
 
 ## 生成的索引
 
@@ -64,7 +69,7 @@ MOC 与索引并存：`index.csv` 用于机器召回，首页和其他 MOC 用�
 
 `audit --scope all` 对当前 HEAD 与工作树的结构、页面、链接、raw 和索引合同执行完整的只读健康检查；`audit --scope changed` 聚焦变更范围。
 
-`begin`、`add`、`context`、`tags` 和 `save` 使用同一合同规则执行严格前置验证。`save` 可以从 Markdown 重建缺失的 `index.csv`，再用与独立 `audit` 相同的规则验证候选检查点。
+`begin`、`add`、`context`、`tags` 和 `save` 使用同一合同规则执行严格前置验证。`audit` 和候选 `save` 在 `tags-review.csv` 存在时验证其结构与策略一致性；已被 HEAD 跟踪的账本缺失时报告合同错误。`save` 可以从 Markdown 重建缺失的 `index.csv`，再用与独立 `audit` 相同的规则验证候选检查点。
 
 ## 原始文件与生命周期
 

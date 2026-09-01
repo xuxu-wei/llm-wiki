@@ -10,7 +10,7 @@ description: 创建、摄入、查询、综合、审计和维护由 Git 管理�
 ## 划分职责
 
 - Git 负责历史、差异、检查点和恢复。
-- 随附的 Python 运行时负责路径、文件、frontmatter、`index.csv`、标签清单与已批准映射、确定性检索、审计和 Git 编排。
+- 随附的 Python 运行时负责路径、文件、frontmatter、`index.csv`、标签策略与已批准映射、确定性检索、审计和 Git 编排。
 - LLM 负责解释、命名、摘要、标签方案、链接、证据判断和正文。
 - 人类负责意图、语义取舍、标签方案确认和高风险变更审批。
 - PDF、电子表格、网页、OCR 和研究工具负责读取原生格式；不要把这些解析器放入 wiki 运行时。
@@ -50,11 +50,13 @@ python "<skill-dir>/scripts/wiki.py" tags <subcommand> --help
 - `begin`：只读检查 HEAD 与待处理变更，返回写入基线。
 - `add`：复制 raw，并建立待整理的来源草稿。
 - `context`：通过结构化查询检索候选，可按需限制数量。
-- `tags`：收集标签评审表，并按用户批准的方案更新页面标签。
+- `tags`：读取标签词表、检查拟用标签、收集审阅表、应用已批准映射并维护决策账本。
 - `audit`：只读检查仓库健康与合同一致性。
 - `save`：按明确范围重建索引、审计并保存 Git 检查点。
 
 除接收目标 vault 路径的 `init` 外，所有命令都从 vault 根目录运行。面向智能体的命令输出使用 JSON；仅在便于人工审阅时使用可读的审计输出。
+
+创建或修改页面标签前，先运行 `tags vocabulary`，把返回的 `preferred_tags`、`forbidden_tags` 和 `rename_map` 交给 LLM。优先使用首选标签，不得生成禁用标签；只有首选词表不能充分描述材料时才提出新标签。写入 frontmatter 前运行 `tags check --tags-json <JSON>`，修正全部被拒绝的标签。
 
 ## 安全写入
 

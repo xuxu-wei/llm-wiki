@@ -33,6 +33,7 @@ from tests.wiki_support import (
 
 INDEX_HEADER = ["path", "kind", "summary", "aliases", "tags"]
 TAG_PLAN_HEADER = ["tag", "page_count", "action", "target"]
+TAG_POLICY_NAME = "tags-review.csv"
 SPREADSHEET_FORMULA_PREFIXES = frozenset("=+-@\t\r\n")
 
 
@@ -43,7 +44,7 @@ def tag_plan_cell(value: str) -> str:
 
 
 def read_tag_plan(path: Path) -> tuple[list[str], list[dict[str, str]]]:
-    with path.open("r", encoding="utf-8", newline="") as handle:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         return list(reader.fieldnames or []), list(reader)
 
@@ -55,7 +56,7 @@ def write_tag_plan(
     header: list[str] | None = None,
 ) -> None:
     fieldnames = header or TAG_PLAN_HEADER
-    with path.open("w", encoding="utf-8", newline="") as handle:
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
@@ -177,10 +178,13 @@ class WikiCliTestCase(unittest.TestCase):
         base: str,
         plan: Path,
         *,
+        amendments: Path | None = None,
         approved: bool = False,
         expected: int = 0,
     ) -> dict[str, object]:
         arguments = ["tags", "apply", "--base", base, "--plan", str(plan)]
+        if amendments is not None:
+            arguments.extend(["--amendments", str(amendments)])
         if approved:
             arguments.append("--approved")
         result = run_cli(*arguments, cwd=vault)
@@ -188,6 +192,61 @@ class WikiCliTestCase(unittest.TestCase):
         self.assert_envelope(payload, "tags", vault, ok=expected == 0)
         if expected == 0 or "action" in payload:
             self.assertEqual(payload.get("action"), "apply", payload)
+        return payload
+
+    def tag_vocabulary(
+        self,
+        vault: Path,
+        *,
+        expected: int = 0,
+    ) -> dict[str, object]:
+        payload = self.assert_exit(run_cli("tags", "vocabulary", cwd=vault), expected)
+        self.assert_envelope(payload, "tags", vault, ok=expected == 0)
+        if expected == 0 or "action" in payload:
+            self.assertEqual(payload.get("action"), "vocabulary", payload)
+        return payload
+
+    def check_tags(
+        self,
+        vault: Path,
+        tags: list[str],
+        *,
+        expected: int = 0,
+    ) -> dict[str, object]:
+        payload = self.assert_exit(
+            run_cli(
+                "tags",
+                "check",
+                "--tags-json",
+                json.dumps(tags, ensure_ascii=False),
+                cwd=vault,
+            ),
+            expected,
+        )
+        self.assert_envelope(payload, "tags", vault, ok=expected == 0)
+        if expected == 0 or "action" in payload:
+            self.assertEqual(payload.get("action"), "check", payload)
+        return payload
+
+    def merge_tags(
+        self,
+        vault: Path,
+        base: str,
+        plan: Path,
+        *,
+        amendments: Path | None = None,
+        approved: bool = False,
+        expected: int = 0,
+    ) -> dict[str, object]:
+        arguments = ["tags", "merge", "--base", base, "--plan", str(plan)]
+        if amendments is not None:
+            arguments.extend(["--amendments", str(amendments)])
+        if approved:
+            arguments.append("--approved")
+        payload = self.assert_exit(run_cli(*arguments, cwd=vault), expected)
+        self.assert_envelope(payload, "tags", vault, ok=expected == 0)
+        if expected == 0 or "action" in payload:
+            self.assertEqual(payload.get("action"), "merge", payload)
         return payload
 
 
@@ -209,6 +268,7 @@ class InitAndSchemaTests(WikiCliTestCase):
                 "AGENTS.md",
                 "知识网络.md",
                 "index.csv",
+                TAG_POLICY_NAME,
                 ".gitattributes",
                 ".gitignore",
             ):
@@ -227,6 +287,12 @@ class InitAndSchemaTests(WikiCliTestCase):
             self.assertEqual(json.loads(rows[0]["aliases"]), [])
             self.assertEqual(json.loads(rows[0]["tags"]), [])
             self.assertNotIn(b"\r\n", (vault / "index.csv").read_bytes())
+            policy_bytes = (vault / TAG_POLICY_NAME).read_bytes()
+            self.assertTrue(policy_bytes.startswith(b"\xef\xbb\xbf"))
+            self.assertEqual(
+                read_tag_plan(vault / TAG_POLICY_NAME),
+                (TAG_PLAN_HEADER, []),
+            )
 
             self.assertEqual(git_status(vault), [])
             top = run_git(vault, "rev-parse", "--show-toplevel")
@@ -236,6 +302,7 @@ class InitAndSchemaTests(WikiCliTestCase):
             self.assertEqual(str(commits.stdout).strip(), "1")
             self.assertRegex((vault / ".gitattributes").read_text(encoding="utf-8"), r"(?m)^raw/\*\*")
             self.assertIn(".obsidian/", (vault / ".gitignore").read_text(encoding="utf-8"))
+            self.assertIn("/tags-review-*.csv", (vault / ".gitignore").read_text(encoding="utf-8"))
 
     def test_init_requires_git_before_writing_the_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -309,7 +376,7 @@ class TagMaintenanceTests(WikiCliTestCase):
                 "note",
                 summary="覆盖标签清单中的 Unicode 和 CSV 特殊字符。",
                 aliases=[],
-                tags=["AI", "ai", "中文,标签", '引"号', "层级/标签", "=1+1", "AI"],
+                tags=["AI", "机器学习", "中文,标签", '引"号', "层级/标签", "=1+1", "AI"],
                 sources=[],
                 body="正文中的 #正文标签 不进入标签清单。",
             )
@@ -349,12 +416,12 @@ class TagMaintenanceTests(WikiCliTestCase):
                     tag_plan_cell(tag): {
                         "tag": tag_plan_cell(tag),
                         "page_count": str(count),
-                        "action": "keep",
+                        "action": "",
                         "target": "",
                     }
                     for tag, count in {
                         "AI": 2,
-                        "ai": 1,
+                        "机器学习": 1,
                         "中文,标签": 1,
                         '引"号': 1,
                         "层级/标签": 1,
@@ -365,6 +432,7 @@ class TagMaintenanceTests(WikiCliTestCase):
                 },
             )
             self.assertNotIn("正文标签", {row["tag"] for row in rows})
+            self.assertTrue(first_plan.read_bytes().startswith(b"\xef\xbb\xbf"))
             self.assertNotIn(b"\r\n", first_plan.read_bytes())
             self.assertEqual(snapshot_files(vault), vault_before)
             self.assertEqual((vault / "index.csv").read_bytes(), index_before)
@@ -408,6 +476,7 @@ class TagMaintenanceTests(WikiCliTestCase):
                 self.assertEqual(plan.parent.resolve(), vault.resolve())
                 self.assertRegex(plan.name, r"^tags-review-.+\.csv$")
                 self.assertEqual(read_tag_plan(plan), (TAG_PLAN_HEADER, []))
+                self.assertTrue(plan.read_bytes().startswith(b"\xef\xbb\xbf"))
                 plan_before = plan.read_bytes()
                 with plan.open("a", encoding="utf-8", newline="") as handle:
                     handle.write("")
@@ -426,7 +495,7 @@ class TagMaintenanceTests(WikiCliTestCase):
                     "--porcelain=v1",
                     "--untracked-files=all",
                 )
-                self.assertEqual(str(status.stdout).splitlines(), [f"?? {plan.name}"])
+                self.assertEqual(str(status.stdout).splitlines(), [])
 
                 other = vault / "other-untracked.txt"
                 other.write_text("不能随 review CSV 一并豁免。\n", encoding="utf-8", newline="\n")
@@ -441,7 +510,7 @@ class TagMaintenanceTests(WikiCliTestCase):
                 self.assertEqual(plan.read_bytes(), plan_before)
                 self.assertEqual((vault / ".git" / "index").read_bytes(), git_index_before)
 
-                run_git(vault, "add", "--", plan.name)
+                run_git(vault, "add", "-f", "--", plan.name)
                 staged_index = (vault / ".git" / "index").read_bytes()
                 self.apply_tags(vault, base, plan, approved=True, expected=3)
                 self.assertEqual((vault / ".git" / "index").read_bytes(), staged_index)
@@ -726,6 +795,8 @@ class TagMaintenanceTests(WikiCliTestCase):
             self.save(vault, git_head(vault), include=["notes/保真.md"])
             base = git_head(vault)
             _payload, plan = self.collect_tags(vault, base, output=root / "preserve.csv")
+            decide_tag(plan, "旧,标签", "keep")
+            decide_tag(plan, "保留", "keep")
             page_mtime = page.stat().st_mtime_ns
             index_before = (vault / "index.csv").read_bytes()
             keep_plan_before = plan.read_bytes()
@@ -776,7 +847,7 @@ class TagMaintenanceTests(WikiCliTestCase):
                 "note",
                 summary="标签映射按页面首次出现顺序去重。",
                 aliases=[],
-                tags=["A", "a", "B", "A", "C", "D", "E", "F"],
+                tags=["A", "B", "C", "A", "D", "E", "F", "G"],
                 sources=[],
             )
             self.save(vault, git_head(vault), include=["notes/tag-order.md"])
@@ -808,25 +879,23 @@ class TagMaintenanceTests(WikiCliTestCase):
                     self.assertEqual(git_status(vault), [])
                     write_tag_plan(source_plan, source_rows, header=header)
 
-            valid_rows = [dict(source_by_tag[tag]) for tag in ("F", "E", "D", "C", "B", "a", "A")]
+            valid_rows = [dict(source_by_tag[tag]) for tag in ("G", "F", "E", "D", "C", "B", "A")]
             decisions = {
                 "A": ("rename", "Z"),
-                "a": ("rename", "Z"),
                 "B": ("rename", "Z"),
                 "C": ("rename", "D"),
                 "D": ("keep", ""),
                 "E": ("delete", ""),
                 "F": ("rename", tag_plan_cell("=canonical")),
+                "G": ("keep", ""),
             }
             for row in valid_rows:
                 row["action"], row["target"] = decisions[row["tag"]]
             write_tag_plan(source_plan, valid_rows)
-            source_plan.write_bytes(
-                b"\xef\xbb\xbf" + source_plan.read_bytes().replace(b"\n", b"\r\n")
-            )
+            source_plan.write_bytes(source_plan.read_bytes().replace(b"\n", b"\r\n"))
             applied = self.apply_tags(vault, base, source_plan, approved=True)
             self.assertEqual(applied.get("changed_paths"), ["notes/tag-order.md"], applied)
-            self.assertRegex(page.read_text(encoding="utf-8"), r'(?m)^tags: \["Z", "D", "=canonical"\]$')
+            self.assertRegex(page.read_text(encoding="utf-8"), r'(?m)^tags: \["Z", "D", "=canonical", "G"\]$')
             self.assertNotRegex(page.read_text(encoding="utf-8"), r'(?m)^tags: \["D", "Z"')
 
     def test_tag_apply_flows_through_context_save_and_audit_with_exact_scope(self) -> None:
@@ -920,10 +989,60 @@ class TagMaintenanceTests(WikiCliTestCase):
                 "--untracked-files=all",
             )
             self.assertIn("私人草稿.txt", str(visible_status.stdout))
-            self.assertIn(plan.name, str(visible_status.stdout))
+            ignored_plan = run_git(vault, "check-ignore", "--", plan.name)
+            self.assertEqual(str(ignored_plan.stdout).strip(), plan.name)
             committed_plan = run_git(vault, "ls-tree", "--name-only", "HEAD", "--", plan.name)
             self.assertEqual(str(committed_plan.stdout).strip(), "")
             unrelated.unlink()
+
+            page_checkpoint = git_head(vault)
+            policy_before = (vault / TAG_POLICY_NAME).read_bytes()
+            merge_preview = self.merge_tags(vault, page_checkpoint, plan, expected=5)
+            self.assertIs(merge_preview.get("review_required"), True, merge_preview)
+            self.assertEqual((vault / TAG_POLICY_NAME).read_bytes(), policy_before)
+            merged = self.merge_tags(vault, page_checkpoint, plan, approved=True)
+            self.assertEqual(merged.get("changed_paths"), [TAG_POLICY_NAME], merged)
+            self.assertEqual(plan.read_bytes(), reviewed_plan)
+
+            policy_preview = self.save(
+                vault,
+                page_checkpoint,
+                operation="tag-policy",
+                include=[TAG_POLICY_NAME],
+                expected=5,
+            )
+            self.assertIs(policy_preview.get("review_required"), True, policy_preview)
+            policy_saved = self.save(
+                vault,
+                page_checkpoint,
+                operation="tag-policy",
+                include=[TAG_POLICY_NAME],
+                approved=True,
+            )
+            self.assertIs(policy_saved.get("saved"), True, policy_saved)
+            policy_commit = git_head(vault)
+            policy_changes = run_git(
+                vault,
+                "-c",
+                "core.quotepath=false",
+                "diff",
+                "--name-only",
+                page_checkpoint,
+                policy_commit,
+                "--",
+            )
+            self.assertEqual(str(policy_changes.stdout).splitlines(), [TAG_POLICY_NAME])
+
+            vocabulary = self.tag_vocabulary(vault)
+            self.assertIn("新检索词", vocabulary.get("preferred_tags", []))
+            self.assertIn("旧检索词", vocabulary.get("forbidden_tags", []))
+            self.assertEqual(vocabulary.get("rename_map"), {"旧检索词": "新检索词"})
+            checked = self.check_tags(vault, ["新检索词", "确有必要的新标签"])
+            self.assertEqual(checked.get("accepted_tags"), ["新检索词"])
+            self.assertEqual(checked.get("new_tags"), ["确有必要的新标签"])
+            rejected = self.check_tags(vault, ["旧检索词"], expected=3)
+            self.assertTrue(rejected.get("rejected_tags"), rejected)
+
             plan.unlink()
             healthy = self.assert_exit(run_cli("audit", "--scope", "all", cwd=vault), 0)
             self.assertIs(healthy.get("valid"), True, healthy)
@@ -941,6 +1060,263 @@ class TagMaintenanceTests(WikiCliTestCase):
             self.assertIs(again.get("changed"), False, again)
             self.assertEqual(again.get("changed_paths"), [], again)
             self.assertEqual(git_status(vault), [])
+
+    def test_collect_inherits_history_and_amendments_update_absent_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vault = self.init_vault(root)
+            policy = vault / TAG_POLICY_NAME
+            write_tag_plan(
+                policy,
+                [
+                    {"tag": "保留词", "page_count": "4", "action": "keep", "target": ""},
+                    {"tag": "历史删除", "page_count": "2", "action": "delete", "target": ""},
+                    {"tag": "历史旧名", "page_count": "7", "action": "rename", "target": "本轮标签"},
+                    {"tag": "旧名称", "page_count": "3", "action": "rename", "target": "规范名称"},
+                ],
+            )
+            policy_base = git_head(vault)
+            self.save(
+                vault,
+                policy_base,
+                operation="tag-policy",
+                include=[TAG_POLICY_NAME],
+                approved=True,
+            )
+            page = write_page(
+                vault,
+                "notes/历史策略.md",
+                "历史策略",
+                "note",
+                summary="验证历史标签决策的继承和补丁。",
+                aliases=[],
+                tags=["保留词", "旧名称", "规范名称", "本轮标签", "全新词"],
+                sources=[],
+            )
+            self.save(vault, git_head(vault), include=["notes/历史策略.md"])
+            base = git_head(vault)
+            _payload, plan = self.collect_tags(vault, base)
+            header, rows = read_tag_plan(plan)
+            self.assertEqual(header, TAG_PLAN_HEADER)
+            by_tag = {row["tag"]: row for row in rows}
+            self.assertEqual(by_tag["保留词"]["action"], "keep")
+            self.assertEqual(by_tag["旧名称"]["action"], "rename")
+            self.assertEqual(by_tag["旧名称"]["target"], "规范名称")
+            self.assertEqual(by_tag["规范名称"]["action"], "keep")
+            self.assertEqual(by_tag["本轮标签"]["action"], "keep")
+            self.assertEqual(by_tag["全新词"]["action"], "")
+            self.assertNotIn("历史旧名", by_tag)
+            self.assertNotIn("历史删除", by_tag)
+
+            decide_tag(plan, "本轮标签", "rename", "最终标签")
+            decide_tag(plan, "全新词", "keep")
+            amendments = vault / "tags-review-amendments-test.csv"
+            write_tag_plan(
+                amendments,
+                [
+                    {
+                        "tag": "历史旧名",
+                        "page_count": "7",
+                        "action": "rename",
+                        "target": "最终标签",
+                    }
+                ],
+            )
+            without_amendment = self.apply_tags(vault, base, plan, approved=True, expected=2)
+            self.assertIn("conflict", json.dumps(without_amendment, ensure_ascii=False).lower())
+            applied = self.apply_tags(
+                vault,
+                base,
+                plan,
+                amendments=amendments,
+                approved=True,
+            )
+            self.assertEqual(applied.get("changed_paths"), ["notes/历史策略.md"], applied)
+            self.assertRegex(
+                page.read_text(encoding="utf-8"),
+                r'(?m)^tags: \["保留词", "规范名称", "最终标签", "全新词"\]$',
+            )
+            self.save(
+                vault,
+                base,
+                operation="tag-maintenance",
+                include=["notes/历史策略.md"],
+                approved=True,
+            )
+            page_checkpoint = git_head(vault)
+            self.merge_tags(
+                vault,
+                page_checkpoint,
+                plan,
+                amendments=amendments,
+                approved=True,
+            )
+            self.save(
+                vault,
+                page_checkpoint,
+                operation="tag-policy",
+                include=[TAG_POLICY_NAME],
+                approved=True,
+            )
+            _policy_header, policy_rows = read_tag_plan(policy)
+            merged = {row["tag"]: row for row in policy_rows}
+            self.assertEqual(merged["历史旧名"]["target"], "最终标签")
+            self.assertEqual(merged["历史旧名"]["page_count"], "7")
+            self.assertEqual(merged["历史删除"]["page_count"], "2")
+            self.assertEqual(merged["本轮标签"]["target"], "最终标签")
+            self.assertEqual(merged["全新词"]["action"], "keep")
+            self.assertTrue(policy.read_bytes().startswith(b"\xef\xbb\xbf"))
+            plan.unlink()
+            amendments.unlink()
+            self.assertEqual(git_status(vault), [])
+
+    def test_existing_vault_without_policy_lazily_creates_it_on_first_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vault = self.init_vault(root)
+            run_git(vault, "rm", "--", TAG_POLICY_NAME)
+            run_git(vault, "commit", "-m", "fixture: vault predates tag policy")
+            self.assertFalse((vault / TAG_POLICY_NAME).exists())
+            self.assertIs(self.assert_exit(run_cli("audit", "--scope", "all", cwd=vault), 0).get("valid"), True)
+            vocabulary = self.tag_vocabulary(vault)
+            self.assertEqual(vocabulary.get("preferred_tags"), [])
+            self.assertEqual(vocabulary.get("forbidden_tags"), [])
+            self.assertEqual(vocabulary.get("rename_map"), {})
+            checked = self.check_tags(vault, ["首次标签"])
+            self.assertEqual(checked.get("new_tags"), ["首次标签"])
+
+            page = write_page(
+                vault,
+                "notes/首次策略.md",
+                "首次策略",
+                "note",
+                summary="首次维护创建持久标签策略。",
+                aliases=[],
+                tags=["首次标签"],
+                sources=[],
+            )
+            self.save(vault, git_head(vault), include=["notes/首次策略.md"])
+            base = git_head(vault)
+            _payload, plan = self.collect_tags(vault, base)
+            decide_tag(plan, "首次标签", "keep")
+            self.assertIs(self.apply_tags(vault, base, plan, approved=True).get("changed"), False)
+            merged = self.merge_tags(vault, base, plan, approved=True)
+            self.assertEqual(merged.get("changed_paths"), [TAG_POLICY_NAME], merged)
+            self.assertTrue((vault / TAG_POLICY_NAME).is_file())
+            self.save(
+                vault,
+                base,
+                operation="tag-policy",
+                include=[TAG_POLICY_NAME],
+                approved=True,
+            )
+            self.assertEqual(
+                read_tag_plan(vault / TAG_POLICY_NAME)[1],
+                [{"tag": "首次标签", "page_count": "1", "action": "keep", "target": ""}],
+            )
+            plan.unlink()
+            self.assertTrue(page.is_file())
+            self.assertEqual(git_status(vault), [])
+
+    def test_policy_and_current_inventory_reject_casefold_collisions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vault = self.init_vault(root)
+            policy = vault / TAG_POLICY_NAME
+            base = git_head(vault)
+            write_tag_plan(
+                policy,
+                [
+                    {"tag": "AI", "page_count": "1", "action": "keep", "target": ""},
+                    {"tag": "ai", "page_count": "1", "action": "keep", "target": ""},
+                ],
+            )
+            invalid = self.assert_exit(run_cli("audit", "--scope", "all", cwd=vault), 4)
+            self.assertTrue(any_nested_key(invalid, "code", "E_TAG_POLICY"), invalid)
+            self.save(
+                vault,
+                base,
+                operation="tag-policy",
+                include=[TAG_POLICY_NAME],
+                approved=True,
+                expected=4,
+            )
+            self.assertEqual(git_head(vault), base)
+
+            write_tag_plan(policy, [])
+            page = write_page(
+                vault,
+                "notes/大小写冲突.md",
+                "大小写冲突",
+                "note",
+                summary="标签清单中的大小写折叠冲突必须失败关闭。",
+                aliases=[],
+                tags=["AI", "ai"],
+                sources=[],
+            )
+            self.save(
+                vault,
+                base,
+                operation="edit",
+                include=[TAG_POLICY_NAME, "notes/大小写冲突.md"],
+            )
+            current = git_head(vault)
+            self.collect_tags(vault, current, output=root / "collision.csv", expected=2)
+            self.assertTrue(page.is_file())
+
+    def test_amendments_are_historical_only_and_preserve_page_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vault = self.init_vault(root)
+            policy = vault / TAG_POLICY_NAME
+            write_tag_plan(
+                policy,
+                [
+                    {"tag": "历史标签", "page_count": "2", "action": "keep", "target": ""},
+                    {"tag": "当前标签", "page_count": "1", "action": "keep", "target": ""},
+                ],
+            )
+            self.save(
+                vault,
+                git_head(vault),
+                operation="tag-policy",
+                include=[TAG_POLICY_NAME],
+                approved=True,
+            )
+            write_page(
+                vault,
+                "notes/补丁边界.md",
+                "补丁边界",
+                "note",
+                summary="补丁只能修改缺席的历史标签决策。",
+                aliases=[],
+                tags=["当前标签"],
+                sources=[],
+            )
+            self.save(vault, git_head(vault), include=["notes/补丁边界.md"])
+            base = git_head(vault)
+            _payload, plan = self.collect_tags(vault, base)
+            cases = {
+                "unknown": {"tag": "未知历史", "page_count": "1", "action": "delete", "target": ""},
+                "overlap": {"tag": "当前标签", "page_count": "1", "action": "delete", "target": ""},
+                "count": {"tag": "历史标签", "page_count": "9", "action": "delete", "target": ""},
+            }
+            for name, row in cases.items():
+                with self.subTest(case=name):
+                    amendment = vault / f"tags-review-amendments-{name}.csv"
+                    write_tag_plan(amendment, [row])
+                    before = snapshot_files(vault)
+                    self.apply_tags(
+                        vault,
+                        base,
+                        plan,
+                        amendments=amendment,
+                        approved=True,
+                        expected=2,
+                    )
+                    self.assertEqual(snapshot_files(vault), before)
+                    amendment.unlink()
+            plan.unlink()
 
     def test_regular_workflows_never_create_or_apply_a_tag_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -974,7 +1350,7 @@ class TagMaintenanceTests(WikiCliTestCase):
             self.assertEqual(page.read_bytes(), original)
             self.assertEqual(
                 sorted(path.name for path in vault.glob("*.csv")),
-                ["index.csv"],
+                ["index.csv", TAG_POLICY_NAME],
             )
 
 

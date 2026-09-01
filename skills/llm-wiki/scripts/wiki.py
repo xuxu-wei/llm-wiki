@@ -33,6 +33,7 @@ EXIT_REVIEW = 5
 
 INDEX_HEADER = ("path", "kind", "summary", "aliases", "tags")
 TAG_PLAN_HEADER = ("tag", "page_count", "action", "target")
+TAG_POLICY_PATH = "tags-review.csv"
 SPREADSHEET_FORMULA_PREFIXES = frozenset("=+-@\t\r\n")
 INDEX_DIRS = ("sources", "notes", "inbox")
 VAULT_DIRS = ("inbox", "raw", "sources", "notes", "assets")
@@ -82,6 +83,7 @@ HIGH_RISK_OPERATIONS = {
     "conflict",
     "control",
     "tag-maintenance",
+    "tag-policy",
 }
 GLOBAL_AUDIT_CODES = {
     "E_VAULT_HEAD",
@@ -91,6 +93,7 @@ GLOBAL_AUDIT_CODES = {
     "E_VAULT_FILE",
     "E_HOME_COUNT",
     "E_RAW_ATTRIBUTES",
+    "E_TAG_POLICY",
 }
 _GIT_HOOKS_PATH_OVERRIDE: str | None = None
 
@@ -152,6 +155,14 @@ class PageRecord:
             "aliases": list(self.aliases),
             "tags": list(self.tags),
         }
+
+
+@dataclass(frozen=True)
+class TagDecision:
+    tag: str
+    page_count: int
+    action: str
+    target: str = ""
 
 
 def emit(payload: dict[str, Any], *, stream: Any = sys.stdout) -> None:
@@ -352,6 +363,8 @@ def portable_path_findings(paths: Iterable[str]) -> list[dict[str, Any]]:
 
 def is_managed_rel(rel: str) -> bool:
     exact = exact_rel_text(rel)
+    if portable_path_key(exact) == portable_path_key(TAG_POLICY_PATH):
+        return True
     if any(portable_path_key(exact) == portable_path_key(core) for core in CORE_HEAD_FILES):
         return True
     pure = PurePosixPath(exact)
@@ -493,6 +506,28 @@ def atomic_write(path: Path, data: bytes, *, expected: bytes | None = None) -> b
         if os.path.exists(temporary):
             os.unlink(temporary)
     return True
+
+
+def atomic_create(path: Path, data: bytes) -> None:
+    """Create one complete file without replacing a concurrently created path."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError as exc:
+            raise WikiError(
+                f"Refusing to overwrite a file created during the operation: {path}",
+                code=EXIT_CONFLICT,
+            ) from exc
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def stable_strings(values: Iterable[str]) -> tuple[str, ...]:
@@ -1336,6 +1371,7 @@ def audit_findings(
 ) -> list[dict[str, Any]]:
     records, findings = collect_records(vault, strict=True, include_body=True)
     findings.extend(wiki_contract_findings(vault))
+    findings.extend(tag_policy_findings(vault))
     required_files = CORE_HEAD_FILES if check_index else CORE_HEAD_FILES - {"index.csv"}
     invalid_required_files: set[str] = set()
     for required in required_files:
@@ -1444,6 +1480,7 @@ def audit_findings(
         *(rel for rel, _path in discovered_raw),
         *(rel for rel, _path in discovered_assets),
         *(required for required in CORE_HEAD_FILES if os.path.lexists(vault / Path(*PurePosixPath(required).parts))),
+        *(path for path in (TAG_POLICY_PATH,) if os.path.lexists(vault / path)),
     }
     findings.extend(portable_path_findings(managed_paths))
     raw_files = [(rel, path) for rel, path in discovered_raw if rel != "raw/.gitkeep"]
@@ -1609,6 +1646,7 @@ def command_init(args: argparse.Namespace) -> int:
         vault / home_rel: home.encode("utf-8"),
         vault / ".gitattributes": attributes.encode("utf-8"),
         vault / ".gitignore": ignore.encode("utf-8"),
+        vault / TAG_POLICY_PATH: build_tag_policy_bytes(()),
         **{vault / directory / KEEP_FILE: b"" for directory in VAULT_DIRS},
     }
     for path, data in files.items():
@@ -1623,6 +1661,7 @@ def command_init(args: argparse.Namespace) -> int:
         "AGENTS.md",
         home_rel,
         "index.csv",
+        TAG_POLICY_PATH,
         ".gitattributes",
         ".gitignore",
         *(f"{directory}/{KEEP_FILE}" for directory in VAULT_DIRS),
@@ -1641,6 +1680,7 @@ def command_init(args: argparse.Namespace) -> int:
             "vault": str(vault),
             "home": home_rel,
             "index": "index.csv",
+            "tag_policy": TAG_POLICY_PATH,
             "commit": commit,
             "clean": not dirty_path_sets(vault)[0],
         }
@@ -1687,28 +1727,61 @@ def command_begin(_args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def tag_sort_key(value: str) -> tuple[str, str]:
+    return (unicodedata.normalize("NFC", value).casefold(), value)
+
+
+def normalized_tag_key(value: str) -> str:
+    return unicodedata.normalize("NFC", value).casefold()
+
+
+def validate_plain_tag(value: str, *, label: str) -> None:
+    if not value:
+        raise WikiError(f"{label} is empty.")
+    if value != value.strip():
+        raise WikiError(f"{label} has leading or trailing whitespace.")
+    if unicodedata.normalize("NFC", value) != value:
+        raise WikiError(f"{label} is not Unicode NFC-normalized.")
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        raise WikiError(f"{label} contains a control character.")
+
+
 def root_tag_plan_rel(vault: Path, plan: Path) -> str | None:
     if plan.parent != vault or not re.fullmatch(r"tags-review-[A-Za-z0-9_-]+\.csv", plan.name):
         return None
     return plan.name
 
 
-def clean_tag_base(vault: Path, value: str, *, allowed_plan: Path | None = None) -> str:
+def resolve_tag_review_path(vault: Path, value: str, *, option: str) -> tuple[Path, str | None]:
+    reject_unsafe_external_path(value, option=option)
+    path = Path(value).expanduser().resolve()
+    if not path_is_within(path, vault):
+        return path, None
+    rel = root_tag_plan_rel(vault, path)
+    if rel is None:
+        raise WikiError(
+            f"{option} inside the vault must name a root temporary review CSV created by tags collect."
+        )
+    return path, rel
+
+
+def clean_tag_base(
+    vault: Path,
+    value: str,
+    *,
+    allowed_plans: Sequence[Path] = (),
+) -> str:
     ensure_wiki_contract(vault)
     base = verify_base(vault, value)
     dirty, staged, untracked = dirty_path_sets(vault)
     allowed: set[str] = set()
     invalid_plan_state = False
-    if allowed_plan is not None:
-        rel = root_tag_plan_rel(vault, allowed_plan)
-        tracked = (
-            git_path_set(vault, ["ls-files", "-z", "--", rel])
-            if rel is not None
-            else set()
-        )
-        if rel is not None and os.path.lexists(allowed_plan) and not tracked:
+    for plan in allowed_plans:
+        rel = root_tag_plan_rel(vault, plan)
+        tracked = git_path_set(vault, ["ls-files", "-z", "--", rel]) if rel is not None else set()
+        if rel is not None and os.path.lexists(plan) and not tracked:
             allowed.add(rel)
-        elif os.path.lexists(allowed_plan):
+        elif path_is_within(plan, vault):
             invalid_plan_state = True
     if invalid_plan_state or staged or dirty - allowed or untracked - allowed:
         raise WikiError(
@@ -1778,13 +1851,348 @@ def decode_tag_plan_cell(value: str) -> str:
     return decoded
 
 
-def build_tag_plan_bytes(counts: dict[str, int]) -> bytes:
+def build_tag_policy_bytes(rows: Sequence[TagDecision]) -> bytes:
     output = io.StringIO(newline="")
     writer = csv.writer(output, lineterminator="\n")
     writer.writerow(TAG_PLAN_HEADER)
-    for tag in sorted(counts, key=lambda item: (item.casefold(), item)):
-        writer.writerow((encode_tag_plan_cell(tag), counts[tag], "keep", ""))
-    return output.getvalue().encode("utf-8")
+    for row in sorted(rows, key=lambda item: tag_sort_key(item.tag)):
+        writer.writerow(
+            (
+                encode_tag_plan_cell(row.tag),
+                row.page_count,
+                row.action,
+                encode_tag_plan_cell(row.target) if row.target else "",
+            )
+        )
+    return output.getvalue().encode("utf-8-sig")
+
+
+def canonical_tag_policy_worktree_bytes(data: bytes) -> bytes:
+    return data.replace(b"\r\n", b"\n")
+
+
+def read_tag_table(
+    path: Path,
+    *,
+    allow_unresolved: bool,
+) -> tuple[tuple[TagDecision, ...], bytes]:
+    if not path.is_file():
+        raise WikiError(f"Tag review CSV is not a regular file: {path}")
+    try:
+        table_bytes = capture_file(path, rel=str(path))
+        text = table_bytes.decode("utf-8-sig")
+    except FileNotFoundError as exc:
+        raise WikiError(f"Tag review CSV does not exist: {path}") from exc
+    except UnicodeDecodeError as exc:
+        raise WikiError(f"Tag review CSV is not valid UTF-8: {path}") from exc
+    try:
+        reader = csv.DictReader(io.StringIO(text, newline=""), strict=True)
+        fieldnames = tuple(reader.fieldnames or ())
+        raw_rows = list(reader)
+    except csv.Error as exc:
+        raise WikiError(f"Tag review CSV contains malformed CSV: {exc}") from exc
+    if fieldnames != TAG_PLAN_HEADER:
+        raise WikiError(
+            "Tag review CSV has the wrong header; expected: " + ",".join(TAG_PLAN_HEADER)
+        )
+
+    rows: list[TagDecision] = []
+    exact_tags: set[str] = set()
+    normalized_tags: dict[str, str] = {}
+    for number, raw_row in enumerate(raw_rows, start=2):
+        if None in raw_row or any(raw_row.get(field) is None for field in TAG_PLAN_HEADER):
+            raise WikiError(f"Tag review CSV row {number} has the wrong number of fields.")
+        raw_tag = raw_row["tag"]
+        if not raw_tag:
+            raise WikiError(f"Tag review CSV row {number} has an empty tag.")
+        try:
+            tag = decode_tag_plan_cell(raw_tag)
+        except ValueError as exc:
+            raise WikiError(f"Tag review CSV row {number} has an unsafe tag cell: {exc}.") from exc
+        validate_plain_tag(tag, label=f"Tag review CSV row {number} tag")
+        if tag in exact_tags:
+            raise WikiError(f"Tag review CSV contains duplicate tag {tag!r}.")
+        key = normalized_tag_key(tag)
+        previous = normalized_tags.get(key)
+        if previous is not None and previous != tag:
+            raise WikiError(
+                "Tag review CSV contains tags that collide after NFC/casefold normalization.",
+                details={"first": previous, "second": tag},
+            )
+        exact_tags.add(tag)
+        normalized_tags[key] = tag
+
+        raw_count = raw_row["page_count"]
+        if not re.fullmatch(r"[1-9][0-9]*", raw_count):
+            raise WikiError(f"Tag review CSV row {number} has an invalid page_count.")
+        action = raw_row["action"]
+        raw_target = raw_row["target"]
+        try:
+            target = decode_tag_plan_cell(raw_target) if raw_target else ""
+        except ValueError as exc:
+            raise WikiError(f"Tag review CSV row {number} has an unsafe target cell: {exc}.") from exc
+        if target:
+            validate_plain_tag(target, label=f"Tag review CSV row {number} target")
+        if action == "" and allow_unresolved:
+            if target:
+                raise WikiError(f"Tag review CSV row {number} has a target but no action.")
+        elif action not in {"keep", "rename", "delete"}:
+            raise WikiError(
+                f"Tag review CSV row {number} has an invalid action {action!r}."
+            )
+        elif action == "rename":
+            if not target:
+                raise WikiError(f"Tag review CSV row {number} must provide a rename target.")
+            if target == tag:
+                raise WikiError(f"Tag review CSV row {number} cannot rename a tag to itself.")
+        elif target:
+            raise WikiError(
+                f"Tag review CSV row {number} action {action!r} requires an empty target."
+            )
+        rows.append(TagDecision(tag, int(raw_count), action, target))
+    return tuple(rows), table_bytes
+
+
+def find_tag_rename_cycles(rename_map: dict[str, str]) -> list[list[str]]:
+    state: dict[str, int] = {}
+    stack: list[str] = []
+    cycles: list[list[str]] = []
+    seen_cycles: set[tuple[str, ...]] = set()
+
+    def visit(tag: str) -> None:
+        state[tag] = 1
+        stack.append(tag)
+        target = rename_map[tag]
+        if target in rename_map:
+            if state.get(target, 0) == 0:
+                visit(target)
+            elif state.get(target) == 1:
+                start = stack.index(target)
+                cycle = stack[start:] + [target]
+                body = cycle[:-1]
+                identity = min(tuple(body[index:] + body[:index]) for index in range(len(body)))
+                if identity not in seen_cycles:
+                    seen_cycles.add(identity)
+                    cycles.append(cycle)
+        stack.pop()
+        state[tag] = 2
+
+    for tag in sorted(rename_map, key=tag_sort_key):
+        if state.get(tag, 0) == 0:
+            visit(tag)
+    return cycles
+
+
+def validate_tag_policy(rows: Sequence[TagDecision], *, label: str) -> None:
+    unresolved = sorted((row.tag for row in rows if not row.action), key=tag_sort_key)
+    if unresolved:
+        raise WikiError(
+            f"{label} contains unresolved tag decisions.",
+            details={"tags": unresolved},
+        )
+    by_tag = {row.tag: row for row in rows}
+    name_registry: dict[str, tuple[str, str]] = {}
+    name_conflicts: list[dict[str, str]] = []
+
+    def register_name(name: str, role: str) -> None:
+        key = normalized_tag_key(name)
+        previous = name_registry.get(key)
+        if previous is not None and previous[0] != name:
+            name_conflicts.append(
+                {
+                    "first": previous[0],
+                    "first_role": previous[1],
+                    "second": name,
+                    "second_role": role,
+                }
+            )
+        else:
+            name_registry[key] = (name, role)
+
+    for row in rows:
+        register_name(row.tag, f"{row.action}_tag")
+    for row in rows:
+        if row.action == "rename":
+            register_name(row.target, f"rename_target_of:{row.tag}")
+    if name_conflicts:
+        raise WikiError(
+            f"{label} has ambiguous tag names after NFC/casefold normalization.",
+            details={"conflicts": name_conflicts},
+        )
+
+    rename_map = {row.tag: row.target for row in rows if row.action == "rename"}
+    conflicts: list[dict[str, Any]] = []
+    for cycle in find_tag_rename_cycles(rename_map):
+        conflicts.append({"type": "rename_cycle", "path": cycle})
+    for source, target in sorted(rename_map.items(), key=lambda item: tag_sort_key(item[0])):
+        target_row = by_tag.get(target)
+        if target_row is None:
+            continue
+        if target_row.action == "delete":
+            conflicts.append({"type": "rename_target_deleted", "source": source, "target": target})
+        elif target_row.action == "rename":
+            conflicts.append(
+                {
+                    "type": "rename_chain",
+                    "source": source,
+                    "target": target,
+                    "next_target": target_row.target,
+                }
+            )
+    if conflicts:
+        raise WikiError(
+            f"{label} contains conflicting tag decisions.",
+            details={"conflicts": conflicts},
+        )
+
+
+def load_tag_policy(vault: Path) -> tuple[tuple[TagDecision, ...], bytes | None]:
+    path = vault / TAG_POLICY_PATH
+    head_variants = sorted(
+        rel
+        for rel in head_tree_paths(vault)
+        if rel != TAG_POLICY_PATH
+        and portable_path_key(rel) == portable_path_key(TAG_POLICY_PATH)
+    )
+    if head_variants:
+        raise WikiError(
+            "Tracked tag policy path conflicts after NFC/casefold normalization.",
+            details={"paths": [TAG_POLICY_PATH, *head_variants]},
+        )
+    collisions = sorted(
+        candidate.name
+        for candidate in vault.iterdir()
+        if candidate.name != TAG_POLICY_PATH
+        and portable_path_key(candidate.name) == portable_path_key(TAG_POLICY_PATH)
+    )
+    if collisions:
+        raise WikiError(
+            "Persistent tag policy path collides after NFC/casefold normalization.",
+            details={"paths": [TAG_POLICY_PATH, *collisions]},
+        )
+    if not os.path.lexists(path):
+        if TAG_POLICY_PATH in head_tree_paths(vault):
+            raise WikiError("Tracked persistent tag policy is missing from the worktree.")
+        return (), None
+    validate_discovered_path(vault, path, label="tag policy")
+    if not path.is_file():
+        raise WikiError("Persistent tag policy is not a regular file.")
+    rows, policy_bytes = read_tag_table(path, allow_unresolved=False)
+    validate_tag_policy(rows, label="Persistent tag policy")
+    canonical = build_tag_policy_bytes(rows)
+    crlf_worktree = canonical.replace(b"\n", b"\r\n")
+    if policy_bytes not in {canonical, crlf_worktree}:
+        raise WikiError(
+            "Persistent tag policy is not in canonical UTF-8 BOM, sorted CSV form."
+        )
+    return rows, policy_bytes
+
+
+def build_tag_vocabulary(rows: Sequence[TagDecision]) -> dict[str, Any]:
+    validate_tag_policy(rows, label="Persistent tag policy")
+    preferred = {row.tag for row in rows if row.action == "keep"}
+    preferred.update(row.target for row in rows if row.action == "rename")
+    forbidden = {row.tag for row in rows if row.action in {"rename", "delete"}}
+    rename_items = sorted(
+        ((row.tag, row.target) for row in rows if row.action == "rename"),
+        key=lambda item: tag_sort_key(item[0]),
+    )
+    return {
+        "preferred_tags": sorted(preferred, key=tag_sort_key),
+        "forbidden_tags": sorted(forbidden, key=tag_sort_key),
+        "rename_map": {source: target for source, target in rename_items},
+    }
+
+
+def tag_policy_findings(vault: Path) -> list[dict[str, Any]]:
+    path = vault / TAG_POLICY_PATH
+    head_paths = head_tree_paths(vault)
+    temporary_paths = sorted(
+        rel
+        for rel in head_paths
+        if len(PurePosixPath(rel).parts) == 1
+        and re.fullmatch(r"tags-review-[A-Za-z0-9_-]+\.csv", rel, flags=re.IGNORECASE)
+    )
+    findings = [
+        finding(
+            "E_TAG_POLICY",
+            rel,
+            "temporary tag review CSV must not be tracked by Git",
+        )
+        for rel in temporary_paths
+    ]
+    for rel in sorted(
+        rel
+        for rel in head_paths
+        if rel != TAG_POLICY_PATH
+        and portable_path_key(rel) == portable_path_key(TAG_POLICY_PATH)
+    ):
+        findings.append(
+            finding(
+                "E_TAG_POLICY",
+                rel,
+                f"tag policy path conflicts with {TAG_POLICY_PATH} after NFC/casefold normalization",
+            )
+        )
+    tracked = TAG_POLICY_PATH in head_paths
+    if not os.path.lexists(path):
+        if tracked:
+            findings.append(
+                finding("E_TAG_POLICY", TAG_POLICY_PATH, "tracked tag policy is missing from the worktree")
+            )
+        return findings
+    try:
+        validate_discovered_path(vault, path, label="tag policy")
+        if not path.is_file():
+            raise WikiError("tag policy is not a regular file")
+        load_tag_policy(vault)
+    except (WikiError, OSError) as exc:
+        findings.append(finding("E_TAG_POLICY", TAG_POLICY_PATH, str(exc)))
+    return findings
+
+
+def prepared_tag_plan(
+    counts: dict[str, int],
+    policy_rows: Sequence[TagDecision],
+) -> tuple[tuple[TagDecision, ...], dict[str, Any]]:
+    policy_by_tag = {row.tag: row for row in policy_rows}
+    rename_targets = {row.target for row in policy_rows if row.action == "rename"}
+    rows: list[TagDecision] = []
+    inherited: list[str] = []
+    implicit_keeps: list[str] = []
+    unresolved: list[str] = []
+    for tag in sorted(counts, key=tag_sort_key):
+        validate_plain_tag(tag, label="Current page tag")
+        historical = policy_by_tag.get(tag)
+        if historical is not None:
+            rows.append(TagDecision(tag, counts[tag], historical.action, historical.target))
+            inherited.append(tag)
+        elif tag in rename_targets:
+            rows.append(TagDecision(tag, counts[tag], "keep", ""))
+            implicit_keeps.append(tag)
+        else:
+            rows.append(TagDecision(tag, counts[tag], "", ""))
+            unresolved.append(tag)
+    # Parsing the generated bytes applies the same exact and portable name rules
+    # used for user-edited plans without changing the current page tags.
+    normalized: dict[str, str] = {}
+    for row in rows:
+        key = normalized_tag_key(row.tag)
+        previous = normalized.get(key)
+        if previous is not None and previous != row.tag:
+            raise WikiError(
+                "Current page tags collide after NFC/casefold normalization.",
+                details={"first": previous, "second": row.tag},
+            )
+        normalized[key] = row.tag
+    return tuple(rows), {
+        "inherited_count": len(inherited),
+        "inherited_tags": sorted(inherited, key=tag_sort_key),
+        "implicit_target_keep_count": len(implicit_keeps),
+        "implicit_target_keep_tags": sorted(implicit_keeps, key=tag_sort_key),
+        "unresolved_count": len(unresolved),
+        "unresolved_tags": sorted(unresolved, key=tag_sort_key),
+    }
 
 
 def path_is_within(path: Path, root: Path) -> bool:
@@ -1855,8 +2263,10 @@ def command_tags_collect(args: argparse.Namespace) -> int:
     base = clean_tag_base(vault, args.base)
     records = tag_records(vault)
     counts, page_count = tag_inventory(records)
+    policy_rows, _policy_bytes = load_tag_policy(vault)
+    plan_rows, preparation = prepared_tag_plan(counts, policy_rows)
     clean_tag_base(vault, base)
-    plan = write_tag_plan(vault, args.output, build_tag_plan_bytes(counts))
+    plan = write_tag_plan(vault, args.output, build_tag_policy_bytes(plan_rows))
     emit(
         {
             "ok": True,
@@ -1867,6 +2277,8 @@ def command_tags_collect(args: argparse.Namespace) -> int:
             "plan": str(plan),
             "tag_count": len(counts),
             "page_count": page_count,
+            **preparation,
+            **build_tag_vocabulary(policy_rows),
         }
     )
     return EXIT_OK
@@ -1875,73 +2287,16 @@ def command_tags_collect(args: argparse.Namespace) -> int:
 def read_tag_plan(
     path: Path,
     counts: dict[str, int],
-) -> tuple[dict[str, tuple[str, str | None]], bytes]:
-    if not path.is_file():
-        raise WikiError(f"Tag plan is not a regular file: {path}")
-    try:
-        plan_bytes = capture_file(path, rel=str(path))
-        text = plan_bytes.decode("utf-8-sig")
-    except FileNotFoundError as exc:
-        raise WikiError(f"Tag plan does not exist: {path}") from exc
-    except UnicodeDecodeError as exc:
-        raise WikiError(f"Tag plan is not valid UTF-8: {path}") from exc
-
-    try:
-        reader = csv.DictReader(io.StringIO(text, newline=""), strict=True)
-        fieldnames = tuple(reader.fieldnames or ())
-        rows = list(reader)
-    except csv.Error as exc:
-        raise WikiError(f"Tag plan contains malformed CSV: {exc}") from exc
-    if fieldnames != TAG_PLAN_HEADER:
-        raise WikiError(
-            "Tag plan has the wrong header; expected: " + ",".join(TAG_PLAN_HEADER)
-        )
-    mapping: dict[str, tuple[str, str | None]] = {}
-    stated_counts: dict[str, int] = {}
-    for number, row in enumerate(rows, start=2):
-        if None in row or any(row.get(field) is None for field in TAG_PLAN_HEADER):
-            raise WikiError(f"Tag plan row {number} has the wrong number of fields.")
-        raw_tag = row["tag"]
-        if not raw_tag:
-            raise WikiError(f"Tag plan row {number} has an empty tag.")
-        try:
-            tag = decode_tag_plan_cell(raw_tag)
-        except ValueError as exc:
-            raise WikiError(f"Tag plan row {number} has an unsafe tag cell: {exc}.") from exc
-        if tag in mapping:
-            raise WikiError(f"Tag plan contains duplicate tag {tag!r}.")
-        raw_count = row["page_count"]
-        if not re.fullmatch(r"[1-9][0-9]*", raw_count):
-            raise WikiError(f"Tag plan row {number} has an invalid page_count.")
-        action = row["action"]
-        if action not in {"keep", "rename", "delete"}:
-            raise WikiError(f"Tag plan row {number} has an invalid action {row['action']!r}.")
-        raw_target = row["target"]
-        try:
-            target = decode_tag_plan_cell(raw_target) if raw_target else ""
-        except ValueError as exc:
-            raise WikiError(f"Tag plan row {number} has an unsafe target cell: {exc}.") from exc
-        if target != target.strip():
-            raise WikiError(f"Tag plan row {number} target has leading or trailing whitespace.")
-        if action == "rename":
-            if not target:
-                raise WikiError(f"Tag plan row {number} must provide a rename target.")
-            if target == tag:
-                raise WikiError(f"Tag plan row {number} cannot rename a tag to itself.")
-            mapped: str | None = target
-        else:
-            if target:
-                raise WikiError(f"Tag plan row {number} action {action!r} requires an empty target.")
-            mapped = tag if action == "keep" else None
-        mapping[tag] = (action, mapped)
-        stated_counts[tag] = int(raw_count)
-
-    if set(mapping) != set(counts):
+) -> tuple[tuple[TagDecision, ...], dict[str, tuple[str, str | None]], bytes]:
+    rows, plan_bytes = read_tag_table(path, allow_unresolved=False)
+    validate_tag_policy(rows, label="Reviewed tag plan")
+    stated_counts = {row.tag: row.page_count for row in rows}
+    if set(stated_counts) != set(counts):
         raise WikiError(
             "Tag plan must contain exactly one row for every current tag.",
             details={
-                "plan_tags": sorted(mapping),
-                "current_tags": sorted(counts),
+                "plan_tags": sorted(stated_counts, key=tag_sort_key),
+                "current_tags": sorted(counts, key=tag_sort_key),
             },
         )
     if stated_counts != counts:
@@ -1950,19 +2305,178 @@ def read_tag_plan(
             code=EXIT_CONFLICT,
             next_step="Run tags collect again and review a fresh plan.",
             details={
-                "plan_tags": sorted(mapping),
-                "current_tags": sorted(counts),
+                "plan_tags": sorted(stated_counts, key=tag_sort_key),
+                "current_tags": sorted(counts, key=tag_sort_key),
             },
         )
-    for tag, (action, target) in mapping.items():
-        if action != "rename" or target not in mapping:
-            continue
-        target_action, _target_value = mapping[target]
-        if target_action != "keep":
-            raise WikiError(
-                f"Tag {tag!r} targets existing tag {target!r}, which must use action 'keep'."
+    mapping = {
+        row.tag: (
+            row.action,
+            row.target if row.action == "rename" else row.tag if row.action == "keep" else None,
+        )
+        for row in rows
+    }
+    return rows, mapping, plan_bytes
+
+
+def apply_tag_policy_amendments(
+    policy_rows: Sequence[TagDecision],
+    amendment_rows: Sequence[TagDecision],
+    *,
+    plan_tags: set[str],
+) -> tuple[tuple[TagDecision, ...], dict[str, Any]]:
+    validate_tag_policy(policy_rows, label="Existing tag policy")
+    validate_tag_policy(amendment_rows, label="Reviewed policy amendments")
+    policy_by_tag = {row.tag: row for row in policy_rows}
+    amendment_by_tag = {row.tag: row for row in amendment_rows}
+    overlap = sorted(plan_tags & set(amendment_by_tag), key=tag_sort_key)
+    if overlap:
+        raise WikiError(
+            "Policy amendments may only update historical tags absent from the current plan.",
+            details={"tags": overlap},
+        )
+    unknown = sorted(set(amendment_by_tag) - set(policy_by_tag), key=tag_sort_key)
+    if unknown:
+        raise WikiError(
+            "Policy amendments may only update tags already present in the persistent policy.",
+            details={"tags": unknown},
+        )
+    mismatches = [
+        {
+            "tag": tag,
+            "policy_page_count": policy_by_tag[tag].page_count,
+            "amendment_page_count": row.page_count,
+        }
+        for tag, row in sorted(amendment_by_tag.items(), key=lambda item: tag_sort_key(item[0]))
+        if policy_by_tag[tag].page_count != row.page_count
+    ]
+    if mismatches:
+        raise WikiError(
+            "Policy amendments must preserve each historical tag's last-reviewed page_count.",
+            details={"mismatches": mismatches},
+        )
+    overrides = sorted(
+        (
+            tag
+            for tag, row in amendment_by_tag.items()
+            if policy_by_tag[tag].action != row.action
+            or policy_by_tag[tag].target != row.target
+        ),
+        key=tag_sort_key,
+    )
+    amended = dict(policy_by_tag)
+    amended.update(amendment_by_tag)
+    result = tuple(sorted(amended.values(), key=lambda row: tag_sort_key(row.tag)))
+    validate_tag_policy(result, label="Tag policy after reviewed amendments")
+    return result, {
+        "amendment_rows": len(amendment_rows),
+        "decision_override_count": len(overrides),
+        "decision_overrides": overrides,
+    }
+
+
+def merge_tag_decisions(
+    policy_rows: Sequence[TagDecision],
+    plan_rows: Sequence[TagDecision],
+) -> tuple[tuple[TagDecision, ...], dict[str, Any]]:
+    validate_tag_policy(policy_rows, label="Existing tag policy")
+    validate_tag_policy(plan_rows, label="Reviewed tag plan")
+    policy_by_tag = {row.tag: row for row in policy_rows}
+    plan_by_tag = {row.tag: row for row in plan_rows}
+    decision_overrides = sorted(
+        (
+            tag
+            for tag, row in plan_by_tag.items()
+            if tag in policy_by_tag
+            and (
+                policy_by_tag[tag].action != row.action
+                or policy_by_tag[tag].target != row.target
             )
-    return mapping, plan_bytes
+        ),
+        key=tag_sort_key,
+    )
+    count_updates = sorted(
+        (
+            tag
+            for tag, row in plan_by_tag.items()
+            if tag in policy_by_tag and policy_by_tag[tag].page_count != row.page_count
+        ),
+        key=tag_sort_key,
+    )
+    new_tags = sorted(set(plan_by_tag) - set(policy_by_tag), key=tag_sort_key)
+    retained = sorted(set(policy_by_tag) - set(plan_by_tag), key=tag_sort_key)
+    merged = dict(policy_by_tag)
+    merged.update(plan_by_tag)
+    result = tuple(sorted(merged.values(), key=lambda row: tag_sort_key(row.tag)))
+    validate_tag_policy(result, label="Prospective merged tag policy")
+    return result, {
+        "policy_rows_before": len(policy_rows),
+        "plan_rows": len(plan_rows),
+        "merged_rows": len(result),
+        "decision_override_count": len(decision_overrides),
+        "decision_overrides": decision_overrides,
+        "page_count_update_count": len(count_updates),
+        "new_tag_count": len(new_tags),
+        "new_tags": new_tags,
+        "retained_history_count": len(retained),
+        "retained_history_tags": retained,
+    }
+
+
+def reviewed_policy_bundle(
+    vault: Path,
+    plan: Path,
+    *,
+    counts: dict[str, int] | None,
+    amendments: Path | None,
+) -> tuple[
+    tuple[TagDecision, ...],
+    dict[str, tuple[str, str | None]],
+    tuple[TagDecision, ...],
+    dict[str, Any],
+    dict[str, Any],
+    bytes,
+    bytes | None,
+    bytes | None,
+]:
+    policy_rows, policy_bytes = load_tag_policy(vault)
+    if counts is None:
+        plan_rows, plan_bytes = read_tag_table(plan, allow_unresolved=False)
+        validate_tag_policy(plan_rows, label="Reviewed tag plan")
+        mapping = {
+            row.tag: (
+                row.action,
+                row.target if row.action == "rename" else row.tag if row.action == "keep" else None,
+            )
+            for row in plan_rows
+        }
+    else:
+        plan_rows, mapping, plan_bytes = read_tag_plan(plan, counts)
+    amendment_bytes: bytes | None = None
+    effective_policy: Sequence[TagDecision] = policy_rows
+    amendment_stats: dict[str, Any] = {
+        "amendment_rows": 0,
+        "decision_override_count": 0,
+        "decision_overrides": [],
+    }
+    if amendments is not None:
+        amendment_rows, amendment_bytes = read_tag_table(amendments, allow_unresolved=False)
+        effective_policy, amendment_stats = apply_tag_policy_amendments(
+            policy_rows,
+            amendment_rows,
+            plan_tags={row.tag for row in plan_rows},
+        )
+    merged, merge_stats = merge_tag_decisions(effective_policy, plan_rows)
+    return (
+        plan_rows,
+        mapping,
+        merged,
+        merge_stats,
+        amendment_stats,
+        plan_bytes,
+        amendment_bytes,
+        policy_bytes,
+    )
 
 
 def planned_tag_updates(
@@ -2012,28 +2526,54 @@ def planned_tag_updates(
 
 def command_tags_apply(args: argparse.Namespace) -> int:
     vault = vault_from_cwd()
-    plan = Path(args.plan).expanduser().resolve()
-    allowed_plan = plan if root_tag_plan_rel(vault, plan) is not None else None
-    if path_is_within(plan, vault) and allowed_plan is None:
-        raise WikiError(
-            "A tag plan inside the vault must be the root review CSV created by tags collect."
+    plan, plan_rel = resolve_tag_review_path(vault, args.plan, option="--plan")
+    amendments: Path | None = None
+    amendments_rel: str | None = None
+    if getattr(args, "amendments", None):
+        amendments, amendments_rel = resolve_tag_review_path(
+            vault, args.amendments, option="--amendments"
         )
-    base = clean_tag_base(vault, args.base, allowed_plan=allowed_plan)
+        if amendments == plan:
+            raise WikiError("--amendments must not name the reviewed tag plan itself.")
+    allowed_plans = tuple(
+        path for path, rel in ((plan, plan_rel), (amendments, amendments_rel)) if path is not None and rel
+    )
+    base = clean_tag_base(vault, args.base, allowed_plans=allowed_plans)
     records = tag_records(vault)
     counts, _page_count = tag_inventory(records)
-    mapping, plan_bytes = read_tag_plan(plan, counts)
+    (
+        _plan_rows,
+        mapping,
+        _merged,
+        merge_stats,
+        amendment_stats,
+        plan_bytes,
+        amendment_bytes,
+        policy_bytes,
+    ) = reviewed_policy_bundle(
+        vault,
+        plan,
+        counts=counts,
+        amendments=amendments,
+    )
     updates = planned_tag_updates(vault, records, mapping)
     planned_paths = sorted(item[0] for item in updates)
     summary = {
         action: sum(1 for item in mapping.values() if item[0] == action)
         for action in ("keep", "rename", "delete")
     }
-    clean_tag_base(vault, base, allowed_plan=allowed_plan)
+    clean_tag_base(vault, base, allowed_plans=allowed_plans)
     if capture_file(plan, rel=str(plan)) != plan_bytes:
         raise WikiError(
             "The tag plan changed while it was being reviewed.",
             code=EXIT_CONFLICT,
             next_step="Review the current tag plan and retry.",
+        )
+    if amendments is not None and capture_file(amendments, rel=str(amendments)) != amendment_bytes:
+        raise WikiError(
+            "The tag policy amendments changed while they were being reviewed.",
+            code=EXIT_CONFLICT,
+            next_step="Review the current amendments and retry.",
         )
     for rel, path, original, _updated in updates:
         if capture_file(path, rel=rel) != original:
@@ -2052,15 +2592,36 @@ def command_tags_apply(args: argparse.Namespace) -> int:
                 "vault": str(vault),
                 "base": base,
                 "plan": str(plan),
+                "amendments": str(amendments) if amendments is not None else None,
                 "approved": False,
                 "changed": False,
                 "changed_paths": planned_paths,
                 "mapping": summary,
+                "policy_merge": merge_stats,
+                "policy_amendments": amendment_stats,
                 "review_required": True,
                 "next": "Review and confirm the tag plan, then repeat with --approved.",
             }
         )
         return EXIT_REVIEW
+
+    # The semantic inputs must still be the exact bytes validated above when
+    # the first page write begins.
+    clean_tag_base(vault, base, allowed_plans=allowed_plans)
+    if capture_file(plan, rel=str(plan)) != plan_bytes:
+        raise WikiError("The tag plan changed before the first page write.", code=EXIT_CONFLICT)
+    if amendments is not None and capture_file(amendments, rel=str(amendments)) != amendment_bytes:
+        raise WikiError(
+            "The tag policy amendments changed before the first page write.",
+            code=EXIT_CONFLICT,
+        )
+    policy_path = vault / TAG_POLICY_PATH
+    latest_policy = current_tag_policy_bytes(policy_path)
+    if latest_policy != policy_bytes:
+        raise WikiError(
+            "The persistent tag policy changed before the first page write.",
+            code=EXIT_CONFLICT,
+        )
 
     changed_paths: list[str] = []
     for rel, path, original, updated in updates:
@@ -2104,10 +2665,13 @@ def command_tags_apply(args: argparse.Namespace) -> int:
             "vault": str(vault),
             "base": base,
             "plan": str(plan),
+            "amendments": str(amendments) if amendments is not None else None,
             "approved": True,
             "changed": bool(changed_paths),
             "changed_paths": sorted(changed_paths),
             "mapping": summary,
+            "policy_merge": merge_stats,
+            "policy_amendments": amendment_stats,
             "review_required": False,
             "next": (
                 "Run save with operation tag-maintenance and the returned changed_paths."
@@ -2116,6 +2680,468 @@ def command_tags_apply(args: argparse.Namespace) -> int:
             ),
         }
     )
+    return EXIT_OK
+
+
+def command_tags_vocabulary(_args: argparse.Namespace) -> int:
+    vault = vault_from_cwd()
+    ensure_wiki_contract(vault)
+    rows, _policy_bytes = load_tag_policy(vault)
+    emit(
+        {
+            "ok": True,
+            "command": "tags",
+            "action": "vocabulary",
+            "vault": str(vault),
+            "policy": TAG_POLICY_PATH,
+            "policy_rows": len(rows),
+            **build_tag_vocabulary(rows),
+        }
+    )
+    return EXIT_OK
+
+
+def parse_proposed_tags(value: str) -> list[str]:
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise WikiError(f"--tags-json is not valid JSON: {exc}.") from exc
+    if not isinstance(decoded, list) or any(not isinstance(item, str) for item in decoded):
+        raise WikiError("--tags-json must be a JSON array of strings.")
+    exact: set[str] = set()
+    normalized: dict[str, str] = {}
+    result: list[str] = []
+    for index, tag in enumerate(decoded):
+        validate_plain_tag(tag, label=f"--tags-json item {index}")
+        if tag in exact:
+            raise WikiError(f"--tags-json contains duplicate tag {tag!r}.")
+        key = normalized_tag_key(tag)
+        previous = normalized.get(key)
+        if previous is not None and previous != tag:
+            raise WikiError(
+                "--tags-json contains tags that collide after NFC/casefold normalization.",
+                details={"first": previous, "second": tag},
+            )
+        exact.add(tag)
+        normalized[key] = tag
+        result.append(tag)
+    return result
+
+
+def command_tags_check(args: argparse.Namespace) -> int:
+    vault = vault_from_cwd()
+    ensure_wiki_contract(vault)
+    rows, _policy_bytes = load_tag_policy(vault)
+    vocabulary = build_tag_vocabulary(rows)
+    proposed = parse_proposed_tags(args.tags_json)
+    preferred = set(vocabulary["preferred_tags"])
+    forbidden = set(vocabulary["forbidden_tags"])
+    rename_map = vocabulary["rename_map"]
+    deleted = {row.tag for row in rows if row.action == "delete"}
+    known_by_key = {normalized_tag_key(tag): tag for tag in preferred | forbidden}
+    accepted: list[str] = []
+    new_tags: list[str] = []
+    rejected: list[dict[str, str]] = []
+    for tag in proposed:
+        if tag in rename_map:
+            rejected.append(
+                {"tag": tag, "reason": "rename_source", "replacement": rename_map[tag]}
+            )
+        elif tag in deleted:
+            rejected.append({"tag": tag, "reason": "deleted_tag"})
+        elif tag in preferred:
+            accepted.append(tag)
+        else:
+            known = known_by_key.get(normalized_tag_key(tag))
+            if known is not None:
+                if known in rename_map:
+                    rejected.append(
+                        {
+                            "tag": tag,
+                            "reason": "noncanonical_rename_source",
+                            "replacement": rename_map[known],
+                        }
+                    )
+                elif known in deleted:
+                    rejected.append({"tag": tag, "reason": "deleted_tag"})
+                else:
+                    rejected.append(
+                        {"tag": tag, "reason": "noncanonical_spelling", "replacement": known}
+                    )
+            else:
+                new_tags.append(tag)
+    emit(
+        {
+            "ok": not rejected,
+            "command": "tags",
+            "action": "check",
+            "vault": str(vault),
+            "policy": TAG_POLICY_PATH,
+            "accepted_tags": accepted,
+            "new_tags": new_tags,
+            "rejected_tags": rejected,
+            "guidance": (
+                "Use preferred tags first. New tags are allowed only when the preferred vocabulary "
+                "cannot adequately describe the material."
+            ),
+        }
+    )
+    return EXIT_OK if not rejected else EXIT_CONFLICT
+
+
+def revision_blob_bytes(vault: Path, revision: str, rel: str) -> bytes | None:
+    result = run_git(vault, ["show", f"{revision}:{rel}"], check=False, binary=True)
+    return result.stdout if result.returncode == 0 else None
+
+
+def revision_tag_snapshot(
+    vault: Path,
+    revision: str,
+) -> dict[str, tuple[tuple[str, ...], bytes]]:
+    snapshot: dict[str, tuple[tuple[str, ...], bytes]] = {}
+    for rel, entry in sorted(exact_tree_entries(vault, revision).items()):
+        if entry.object_type != "blob" or not is_indexable_rel(rel):
+            continue
+        data = revision_blob_bytes(vault, revision, rel)
+        if data is None:
+            raise WikiError(
+                f"Cannot read page {rel} from checkpoint {revision}.",
+                code=EXIT_CONFLICT,
+            )
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise WikiError(
+                f"Markdown is not valid UTF-8 in checkpoint {revision}: {rel}",
+                code=EXIT_CONFLICT,
+            ) from exc
+        values, _body, errors = parse_frontmatter_text(text)
+        raw_tags = values.get("tags", [])
+        if errors or not isinstance(raw_tags, list) or any(
+            not isinstance(item, str) for item in raw_tags
+        ):
+            raise WikiError(
+                f"Page metadata is invalid in checkpoint {revision}: {rel}",
+                code=EXIT_CONFLICT,
+            )
+        snapshot[rel] = (ordered_strings(raw_tags), data)
+    return snapshot
+
+
+def snapshot_tag_inventory(
+    snapshot: dict[str, tuple[tuple[str, ...], bytes]],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for tags, _data in snapshot.values():
+        for tag in tags:
+            counts[tag] = counts.get(tag, 0) + 1
+    return counts
+
+
+def expected_tag_snapshot(
+    snapshot: dict[str, tuple[tuple[str, ...], bytes]],
+    mapping: dict[str, tuple[str, str | None]],
+) -> tuple[dict[str, bytes], set[str]]:
+    expected: dict[str, bytes] = {}
+    changed: set[str] = set()
+    for rel, (current, original) in snapshot.items():
+        revised: list[str] = []
+        seen: set[str] = set()
+        for tag in current:
+            decision = mapping.get(tag)
+            if decision is None:
+                raise WikiError(
+                    "The reviewed plan does not match the tag inventory of its source checkpoint.",
+                    code=EXIT_CONFLICT,
+                    details={"path": rel, "tag": tag},
+                )
+            target = decision[1]
+            if target is not None and target not in seen:
+                seen.add(target)
+                revised.append(target)
+        if tuple(revised) == current:
+            expected[rel] = original
+            continue
+        try:
+            text = original.decode("utf-8")
+        except UnicodeDecodeError as exc:  # already checked by revision_tag_snapshot
+            raise WikiError(f"Markdown is not valid UTF-8: {rel}", code=EXIT_CONFLICT) from exc
+        expected[rel] = replace_frontmatter_list(text, "tags", revised).encode("utf-8")
+        changed.add(rel)
+    return expected, changed
+
+
+def verify_tag_policy_checkpoint(
+    vault: Path,
+    plan_rows: Sequence[TagDecision],
+    mapping: dict[str, tuple[str, str | None]],
+) -> dict[str, Any]:
+    current = head_oid(vault)
+    stated_counts = {row.tag: row.page_count for row in plan_rows}
+    current_snapshot = revision_tag_snapshot(vault, current)
+    current_counts = snapshot_tag_inventory(current_snapshot)
+    if current_counts == stated_counts:
+        _expected, changed = expected_tag_snapshot(current_snapshot, mapping)
+        if not changed:
+            return {
+                "mode": "no-page-change",
+                "source_checkpoint": current,
+                "page_checkpoint": current,
+                "changed_paths": [],
+            }
+
+    parents = run_git(vault, ["rev-list", "--parents", "-n", "1", current]).stdout.split()
+    if len(parents) != 2:
+        raise WikiError(
+            "The current HEAD is not a single-parent page checkpoint for this tag plan.",
+            code=EXIT_CONFLICT,
+            next_step="Apply and save the reviewed page changes before merging the tag policy.",
+        )
+    parent = parents[1]
+    parent_snapshot = revision_tag_snapshot(vault, parent)
+    parent_counts = snapshot_tag_inventory(parent_snapshot)
+    if parent_counts != stated_counts:
+        raise WikiError(
+            "The reviewed tag plan does not match the parent of the current page checkpoint.",
+            code=EXIT_CONFLICT,
+            next_step="Use the plan that produced the current page checkpoint, or begin a fresh maintenance round.",
+            details={
+                "plan_tags": sorted(stated_counts, key=tag_sort_key),
+                "checkpoint_tags": sorted(parent_counts, key=tag_sort_key),
+            },
+        )
+    expected, changed = expected_tag_snapshot(parent_snapshot, mapping)
+    if not changed:
+        raise WikiError(
+            "The current HEAD is not the required page checkpoint for this no-op tag plan.",
+            code=EXIT_CONFLICT,
+        )
+    if set(current_snapshot) != set(expected):
+        raise WikiError(
+            "The page checkpoint added or removed indexable pages outside the reviewed tag plan.",
+            code=EXIT_CONFLICT,
+        )
+    mismatched = sorted(
+        rel
+        for rel, expected_bytes in expected.items()
+        if current_snapshot[rel][1] != expected_bytes
+    )
+    parent_entries = exact_tree_entries(vault, parent)
+    current_entries = exact_tree_entries(vault, current)
+    mode_mismatches = sorted(
+        rel
+        for rel in {*changed, "index.csv"}
+        if rel not in parent_entries
+        or rel not in current_entries
+        or parent_entries[rel].mode != current_entries[rel].mode
+        or parent_entries[rel].object_type != "blob"
+        or current_entries[rel].object_type != "blob"
+    )
+    actual_changes = set(exact_tree_changes(vault, parent, current))
+    expected_changes = {*changed, "index.csv"}
+    if mismatched or mode_mismatches or actual_changes != expected_changes:
+        raise WikiError(
+            "The current HEAD does not exactly match the page checkpoint produced by this tag plan.",
+            code=EXIT_CONFLICT,
+            next_step="Inspect the checkpoint and use the matching reviewed plan.",
+            details={
+                "mismatched_pages": mismatched,
+                "mode_mismatches": mode_mismatches,
+                "expected_changes": sorted(expected_changes),
+                "actual_changes": sorted(actual_changes),
+            },
+        )
+    return {
+        "mode": "page-checkpoint",
+        "source_checkpoint": parent,
+        "page_checkpoint": current,
+        "changed_paths": sorted(changed),
+    }
+
+
+def current_tag_policy_bytes(path: Path) -> bytes | None:
+    if not os.path.lexists(path):
+        return None
+    validate_discovered_path(path.parent, path, label="tag policy")
+    if not path.is_file():
+        raise WikiError(
+            "The persistent tag policy path appeared with an invalid file type.",
+            code=EXIT_CONFLICT,
+        )
+    return capture_file(path, rel=TAG_POLICY_PATH)
+
+
+def command_tags_merge(args: argparse.Namespace) -> int:
+    vault = vault_from_cwd()
+    plan, plan_rel = resolve_tag_review_path(vault, args.plan, option="--plan")
+    amendments: Path | None = None
+    amendments_rel: str | None = None
+    if getattr(args, "amendments", None):
+        amendments, amendments_rel = resolve_tag_review_path(
+            vault, args.amendments, option="--amendments"
+        )
+        if amendments == plan:
+            raise WikiError("--amendments must not name the reviewed tag plan itself.")
+    allowed_plans = tuple(
+        path for path, rel in ((plan, plan_rel), (amendments, amendments_rel)) if path is not None and rel
+    )
+    base = clean_tag_base(vault, args.base, allowed_plans=allowed_plans)
+    findings = audit_findings(vault)
+    if findings:
+        raise WikiError(
+            "Tag policy merge requires a healthy page checkpoint.",
+            code=EXIT_AUDIT,
+            next_step="Correct the audit findings before merging the reviewed policy.",
+            details={"findings": findings},
+        )
+    (
+        plan_rows,
+        mapping,
+        merged,
+        merge_stats,
+        amendment_stats,
+        plan_bytes,
+        amendment_bytes,
+        policy_bytes,
+    ) = reviewed_policy_bundle(
+        vault,
+        plan,
+        counts=None,
+        amendments=amendments,
+    )
+    checkpoint = verify_tag_policy_checkpoint(vault, plan_rows, mapping)
+    merged_bytes = build_tag_policy_bytes(merged)
+    changed = (
+        policy_bytes is None
+        or canonical_tag_policy_worktree_bytes(policy_bytes) != merged_bytes
+    )
+    changed_paths = [TAG_POLICY_PATH] if changed else []
+    summary = {
+        action: sum(1 for row in plan_rows if row.action == action)
+        for action in ("keep", "rename", "delete")
+    }
+
+    clean_tag_base(vault, base, allowed_plans=allowed_plans)
+    if capture_file(plan, rel=str(plan)) != plan_bytes:
+        raise WikiError(
+            "The tag plan changed while the policy merge was being prepared.",
+            code=EXIT_CONFLICT,
+        )
+    if amendments is not None and capture_file(amendments, rel=str(amendments)) != amendment_bytes:
+        raise WikiError(
+            "The tag policy amendments changed while the policy merge was being prepared.",
+            code=EXIT_CONFLICT,
+        )
+    policy_path = vault / TAG_POLICY_PATH
+    current_policy_bytes = current_tag_policy_bytes(policy_path)
+    if current_policy_bytes != policy_bytes:
+        raise WikiError(
+            "The persistent tag policy changed while the merge was being prepared.",
+            code=EXIT_CONFLICT,
+        )
+
+    payload = {
+        "ok": bool(args.approved),
+        "command": "tags",
+        "action": "merge",
+        "vault": str(vault),
+        "base": base,
+        "plan": str(plan),
+        "amendments": str(amendments) if amendments is not None else None,
+        "policy": TAG_POLICY_PATH,
+        "approved": bool(args.approved),
+        "changed": changed,
+        "changed_paths": changed_paths,
+        "mapping": summary,
+        "checkpoint": checkpoint,
+        "policy_merge": merge_stats,
+        "policy_amendments": amendment_stats,
+        "vocabulary": build_tag_vocabulary(merged),
+    }
+    if not args.approved:
+        payload.update(
+            {
+                "review_required": True,
+                "next": "Review the prospective policy merge, then repeat with --approved.",
+            }
+        )
+        emit(payload)
+        return EXIT_REVIEW
+
+    # Repeat every read-only guard immediately before the single policy write.
+    clean_tag_base(vault, base, allowed_plans=allowed_plans)
+    if capture_file(plan, rel=str(plan)) != plan_bytes:
+        raise WikiError("The tag plan changed before the policy write.", code=EXIT_CONFLICT)
+    if amendments is not None and capture_file(amendments, rel=str(amendments)) != amendment_bytes:
+        raise WikiError("The tag policy amendments changed before the policy write.", code=EXIT_CONFLICT)
+    verify_tag_policy_checkpoint(vault, plan_rows, mapping)
+    clean_tag_base(vault, base, allowed_plans=allowed_plans)
+    if capture_file(plan, rel=str(plan)) != plan_bytes:
+        raise WikiError("The tag plan changed during checkpoint verification.", code=EXIT_CONFLICT)
+    if amendments is not None and capture_file(amendments, rel=str(amendments)) != amendment_bytes:
+        raise WikiError(
+            "The tag policy amendments changed during checkpoint verification.",
+            code=EXIT_CONFLICT,
+        )
+    latest_policy = current_tag_policy_bytes(policy_path)
+    if latest_policy != policy_bytes:
+        raise WikiError("The persistent tag policy changed before the policy write.", code=EXIT_CONFLICT)
+    if head_oid(vault) != base:
+        raise WikiError("The wiki HEAD changed before the policy write.", code=EXIT_CONFLICT)
+    if changed:
+        if policy_bytes is None:
+            atomic_create(policy_path, merged_bytes)
+        else:
+            atomic_write(policy_path, merged_bytes, expected=policy_bytes)
+        if policy_path.read_bytes() != merged_bytes:
+            raise WikiError(
+                "The persistent tag policy failed read-back verification.",
+                code=EXIT_CONFLICT,
+            )
+    try:
+        post_write_conflict = head_oid(vault) != base
+        post_write_conflict = post_write_conflict or capture_file(plan, rel=str(plan)) != plan_bytes
+        if amendments is not None:
+            post_write_conflict = post_write_conflict or (
+                capture_file(amendments, rel=str(amendments)) != amendment_bytes
+            )
+        expected_policy_bytes = merged_bytes if changed else policy_bytes
+        post_write_conflict = post_write_conflict or (
+            current_tag_policy_bytes(policy_path) != expected_policy_bytes
+        )
+        dirty, staged, untracked = dirty_path_sets(vault)
+        allowed_dirty = {
+            rel
+            for path in allowed_plans
+            for rel in (root_tag_plan_rel(vault, path),)
+            if rel is not None
+        }
+        if changed:
+            allowed_dirty.add(TAG_POLICY_PATH)
+        post_write_conflict = post_write_conflict or bool(
+            staged or dirty - allowed_dirty or untracked - allowed_dirty
+        )
+    except (WikiError, OSError):
+        post_write_conflict = True
+    if post_write_conflict:
+        raise WikiError(
+            "The wiki HEAD or reviewed inputs changed while the tag policy was being written.",
+            code=EXIT_CONFLICT,
+            next_step="Inspect the visible tag policy change and concurrent repository state before retrying.",
+            details={"changed_paths": changed_paths},
+        )
+    payload.update(
+        {
+            "ok": True,
+            "review_required": False,
+            "next": (
+                "Save tags-review.csv in a separate checkpoint with operation tag-policy."
+                if changed
+                else "The persistent tag policy already matches the reviewed decisions."
+            ),
+        }
+    )
+    emit(payload)
     return EXIT_OK
 
 
@@ -2889,6 +3915,129 @@ def candidate_raw_findings(
     return findings
 
 
+def candidate_tag_policy_findings(
+    source: Path,
+    base: str,
+    candidate_repository: Path,
+    candidate: str,
+) -> list[dict[str, Any]]:
+    base_entries = exact_tree_entries(source, base)
+    candidate_entries = exact_tree_entries(candidate_repository, candidate)
+    if TAG_POLICY_PATH in base_entries and TAG_POLICY_PATH not in candidate_entries:
+        return [
+            finding(
+                "E_TAG_POLICY",
+                TAG_POLICY_PATH,
+                "a tag policy tracked by the base checkpoint cannot be deleted",
+            )
+        ]
+    return []
+
+
+def candidate_tag_operation_findings(
+    repository: Path,
+    base: str,
+    candidate: str,
+    operation: str,
+    changes: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Keep the two approved tag checkpoints mechanically separate."""
+
+    normalized = operation.strip().casefold().replace("_", "-")
+    if normalized == "tag-policy":
+        unexpected = sorted(path for path in changes if path != TAG_POLICY_PATH)
+        if unexpected:
+            return [
+                finding(
+                    "E_TAG_CHECKPOINT",
+                    unexpected[0],
+                    "tag-policy checkpoints may change only tags-review.csv",
+                )
+            ]
+        return []
+    if normalized != "tag-maintenance":
+        return []
+
+    page_changes = sorted(path for path in changes if path != "index.csv")
+    if not page_changes and "index.csv" in changes:
+        return [
+            finding(
+                "E_TAG_CHECKPOINT",
+                "index.csv",
+                "tag-maintenance cannot be used for an index-only checkpoint",
+            )
+        ]
+    for rel in page_changes:
+        if not is_indexable_rel(rel):
+            return [
+                finding(
+                    "E_TAG_CHECKPOINT",
+                    rel,
+                    "tag-maintenance checkpoints may change only indexable Markdown pages",
+                )
+            ]
+        before = revision_blob_bytes(repository, base, rel)
+        after = revision_blob_bytes(repository, candidate, rel)
+        if before is None or after is None:
+            return [
+                finding(
+                    "E_TAG_CHECKPOINT",
+                    rel,
+                    "tag-maintenance cannot create or delete pages",
+                )
+            ]
+        try:
+            before_text = before.decode("utf-8")
+            after_text = after.decode("utf-8")
+        except UnicodeDecodeError:
+            return [
+                finding(
+                    "E_TAG_CHECKPOINT",
+                    rel,
+                    "tag-maintenance pages must remain valid UTF-8",
+                )
+            ]
+        before_values, _before_body, before_errors = parse_frontmatter_text(before_text)
+        after_values, _after_body, after_errors = parse_frontmatter_text(after_text)
+        before_tags = before_values.get("tags", [])
+        after_tags = after_values.get("tags", [])
+        if (
+            before_errors
+            or after_errors
+            or not isinstance(before_tags, list)
+            or not isinstance(after_tags, list)
+            or any(not isinstance(item, str) for item in before_tags)
+            or any(not isinstance(item, str) for item in after_tags)
+        ):
+            return [
+                finding(
+                    "E_TAG_CHECKPOINT",
+                    rel,
+                    "tag-maintenance requires valid tags metadata in both checkpoints",
+                )
+            ]
+        old_tags = ordered_strings(before_tags)
+        new_tags = ordered_strings(after_tags)
+        if old_tags == new_tags:
+            return [
+                finding(
+                    "E_TAG_CHECKPOINT",
+                    rel,
+                    "tag-maintenance page changes must modify tags",
+                )
+            ]
+        expected = replace_frontmatter_list(before_text, "tags", new_tags).encode("utf-8")
+        if after != expected:
+            return [
+                finding(
+                    "E_TAG_CHECKPOINT",
+                    rel,
+                    "tag-maintenance page changes must be limited to the top-level tags field",
+                )
+            ]
+    return []
+
+
 def revision_text(repository: Path, revision: str, rel: str) -> str | None:
     result = run_git(repository, ["show", f"{revision}:{rel}"], check=False, binary=True)
     if result.returncode != 0:
@@ -2910,6 +4059,8 @@ def candidate_structural_risks(
     risks = [f"operation:{normalized}"] if normalized in HIGH_RISK_OPERATIONS else []
     base_entries = exact_tree_entries(repository, base)
     candidate_entries = exact_tree_entries(repository, candidate)
+    if base_entries.get(TAG_POLICY_PATH) != candidate_entries.get(TAG_POLICY_PATH):
+        risks.append(f"{TAG_POLICY_PATH}: changed persistent tag policy")
     deleted = sorted(
         rel for rel in changes if rel != "index.csv" and rel in base_entries and rel not in candidate_entries
     )
@@ -2999,10 +4150,14 @@ def build_candidate_checkpoint(
         run_git(repository, ["update-ref", "HEAD", commit, base])
 
     source_git_dir = Path(run_git(vault, ["rev-parse", "--absolute-git-dir"]).stdout.strip())
+    changes = exact_tree_changes(repository, base, commit)
     findings = audit_findings(repository, attributes_git_dir=source_git_dir)
     findings.extend(candidate_raw_findings(vault, base, repository, commit))
+    findings.extend(candidate_tag_policy_findings(vault, base, repository, commit))
+    findings.extend(
+        candidate_tag_operation_findings(repository, base, commit, operation, changes)
+    )
     findings = sorted(findings, key=lambda item: (item["path"], item["code"], item["message"]))
-    changes = exact_tree_changes(repository, base, commit)
     risks = candidate_structural_risks(repository, base, commit, operation, changes)
     diff = run_git(
         repository,
@@ -3308,10 +4463,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     tags = subparsers.add_parser(
         "tags",
-        help="Collect and apply a user-approved tag normalization plan.",
-        description="Run the manually triggered workflow for reviewing and normalizing page tags.",
+        help="Use and maintain a user-approved persistent tag policy.",
+        description="Use the persistent tag vocabulary or run the manually triggered tag review workflow.",
     )
     tag_actions = tags.add_subparsers(dest="tags_action", required=True)
+    tags_vocabulary = tag_actions.add_parser(
+        "vocabulary",
+        help="Return preferred, forbidden, and renamed tags.",
+        description="Read the persistent tag decision ledger and return its vocabulary without writing.",
+    )
+    tags_vocabulary.set_defaults(func=command_tags_vocabulary)
+    tags_check = tag_actions.add_parser(
+        "check",
+        help="Check proposed page tags against the persistent policy.",
+        description="Reject forbidden or noncanonical proposed tags and report genuinely new tags without writing.",
+    )
+    tags_check.add_argument(
+        "--tags-json",
+        required=True,
+        help="JSON array of final tag strings proposed for one page.",
+    )
+    tags_check.set_defaults(func=command_tags_check)
     tags_collect = tag_actions.add_parser(
         "collect",
         help="Collect the current tag inventory into a review CSV.",
@@ -3343,11 +4515,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reviewed CSV created by tags collect.",
     )
     tags_apply.add_argument(
+        "--amendments",
+        help="Optional reviewed CSV updating historical policy rows absent from the current plan.",
+    )
+    tags_apply.add_argument(
         "--approved",
         action="store_true",
         help="Confirm that the user reviewed and approved the complete tag plan.",
     )
     tags_apply.set_defaults(func=command_tags_apply)
+    tags_merge = tag_actions.add_parser(
+        "merge",
+        help="Merge reviewed decisions into the persistent tag policy.",
+        description="Verify the matching page checkpoint, preview the policy change, and atomically update tags-review.csv after approval.",
+    )
+    tags_merge.add_argument(
+        "--base",
+        required=True,
+        help="Clean page-checkpoint OID returned by begin after the page tag changes were saved.",
+    )
+    tags_merge.add_argument(
+        "--plan",
+        required=True,
+        help="Reviewed CSV previously applied to the matching page checkpoint.",
+    )
+    tags_merge.add_argument(
+        "--amendments",
+        help="Optional reviewed CSV updating historical policy rows absent from the current plan.",
+    )
+    tags_merge.add_argument(
+        "--approved",
+        action="store_true",
+        help="Confirm that the user reviewed and approved the complete policy merge.",
+    )
+    tags_merge.set_defaults(func=command_tags_merge)
 
     audit = subparsers.add_parser(
         "audit",

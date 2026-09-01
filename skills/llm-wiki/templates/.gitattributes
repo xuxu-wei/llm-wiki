@@ -1,4 +1,5 @@
 * text=auto
 *.md text eol=lf
 index.csv text eol=lf
+tags-review.csv text eol=lf
 raw/** -text -diff -eol
