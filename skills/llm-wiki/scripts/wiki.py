@@ -84,6 +84,7 @@ HIGH_RISK_OPERATIONS = {
     "control",
     "tag-maintenance",
     "tag-policy",
+    "raw-update",
 }
 GLOBAL_AUDIT_CODES = {
     "E_VAULT_HEAD",
@@ -1511,17 +1512,6 @@ def audit_findings(
     )
     findings.extend(body_link_findings(vault, records, [*raw_files, *discovered_assets]))
 
-    for rel, expected in head_raw_blobs(vault).items():
-        path = vault / Path(*PurePosixPath(rel).parts)
-        if not os.path.lexists(path):
-            findings.append(finding("E_RAW_IMMUTABLE", rel, "committed raw path was deleted or moved"))
-            continue
-        try:
-            discovered_rel = validate_discovered_path(vault, path, label="committed raw path")
-            if discovered_rel != rel or not path.is_file() or git_blob_oid(path, vault) != expected:
-                findings.append(finding("E_RAW_IMMUTABLE", rel, "committed raw bytes were modified"))
-        except WikiError as exc:
-            findings.append(finding("E_RAW_IMMUTABLE", rel, str(exc)))
     return unique_findings(findings)
 
 
@@ -1709,6 +1699,7 @@ def command_begin(_args: argparse.Namespace) -> int:
     ensure_wiki_contract(vault)
     changes = change_inventory(vault)
     base = head_oid(vault)
+    raw_impact = raw_impact_from_worktree(vault, base)
     emit(
         {
             "ok": True,
@@ -1717,10 +1708,15 @@ def command_begin(_args: argparse.Namespace) -> int:
             "base": base,
             "clean": not changes,
             "changes": changes,
+            "raw_impact": raw_impact,
             "next": (
                 "Start the requested operation using this base."
                 if not changes
-                else "Review and checkpoint the existing changes before starting unrelated work."
+                else (
+                    "Review raw_impact one active distance layer at a time before saving."
+                    if raw_impact is not None
+                    else "Review and checkpoint the existing changes before starting unrelated work."
+                )
             ),
         }
     )
@@ -3715,6 +3711,16 @@ class TreeEntry:
 
 
 @dataclass(frozen=True)
+class ImpactPage:
+    path: str
+    kind: str
+    aliases: tuple[str, ...]
+    sources: tuple[str, ...]
+    raw: tuple[str, ...]
+    body: str
+
+
+@dataclass(frozen=True)
 class CandidateCheckpoint:
     repository: Path
     commit: str
@@ -3727,6 +3733,7 @@ class CandidateCheckpoint:
     git_index_bytes: bytes
     findings: tuple[dict[str, Any], ...]
     diff: str
+    raw_impact: dict[str, Any] | None
 
 
 def exact_tree_entries(repository: Path, revision: str) -> dict[str, TreeEntry]:
@@ -3760,6 +3767,401 @@ def exact_tree_changes(repository: Path, base: str, candidate: str) -> tuple[str
         binary=True,
     )
     return tuple(sorted(decode_nul(result.stdout)))
+
+
+def raw_snapshot_from_revision(repository: Path, revision: str) -> dict[str, str]:
+    return {
+        rel: entry.oid
+        for rel, entry in exact_tree_entries(repository, revision).items()
+        if rel.startswith("raw/")
+        and rel != "raw/.gitkeep"
+        and entry.object_type == "blob"
+    }
+
+
+def raw_snapshot_from_worktree(vault: Path) -> dict[str, str]:
+    files, _findings = discover_files_under(vault, "raw", label="raw impact path")
+    return {
+        rel: git_blob_oid(path, vault)
+        for rel, path in files
+        if rel != "raw/.gitkeep"
+    }
+
+
+def impact_page_from_bytes(rel: str, data: bytes) -> ImpactPage | None:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    values, body, errors = parse_frontmatter_text(text)
+    kind = values.get("kind")
+    if errors or kind not in {"source", "note"}:
+        return None
+    parsed: dict[str, tuple[str, ...]] = {}
+    for field in ("aliases", "sources", "raw"):
+        value = values.get(field, [])
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            return None
+        parsed[field] = stable_strings(value)
+    return ImpactPage(
+        path=rel,
+        kind=kind,
+        aliases=parsed["aliases"],
+        sources=parsed["sources"],
+        raw=parsed["raw"],
+        body=body,
+    )
+
+
+def impact_pages_from_revision(repository: Path, revision: str) -> dict[str, ImpactPage]:
+    pages: dict[str, ImpactPage] = {}
+    for rel, entry in sorted(exact_tree_entries(repository, revision).items()):
+        if entry.object_type != "blob" or not is_indexable_rel(rel):
+            continue
+        data = revision_blob_bytes(repository, revision, rel)
+        if data is None:
+            continue
+        page = impact_page_from_bytes(rel, data)
+        if page is not None:
+            pages[rel] = page
+    return pages
+
+
+def impact_pages_from_worktree(vault: Path) -> dict[str, ImpactPage]:
+    pages: dict[str, ImpactPage] = {}
+    paths, _findings = iter_indexable_pages(vault)
+    for path in paths:
+        rel = exact_rel_text(path.relative_to(vault).as_posix())
+        try:
+            data = capture_file(path, rel=rel)
+        except WikiError:
+            continue
+        page = impact_page_from_bytes(rel, data)
+        if page is not None:
+            pages[rel] = page
+    return pages
+
+
+def resolve_impact_wikilink(
+    original: str,
+    *,
+    page_paths: set[str],
+    page_names: dict[str, set[str]],
+    raw_paths: set[str],
+    raw_names: dict[str, set[str]],
+) -> tuple[str, str] | None:
+    target = link_target(original)
+    if not target or target.startswith("^") or "://" in target:
+        return None
+    pure = PurePosixPath(target)
+    if len(pure.parts) > 1:
+        first = pure.parts[0]
+        if first in {"sources", "notes"}:
+            rel = target if target.casefold().endswith(".md") else target + ".md"
+            return ("page", rel) if rel in page_paths else None
+        if first == "raw":
+            return ("raw", target) if target in raw_paths else None
+        return None
+
+    page_name = pure.stem if pure.suffix.casefold() == ".md" else pure.name
+    candidates = set(page_names.get(page_name.casefold(), set()))
+    candidates.update(page_names.get(target.casefold(), set()))
+    if len(candidates) == 1:
+        return "page", next(iter(candidates))
+    raw_candidates = raw_names.get(pure.name.casefold(), set())
+    if len(raw_candidates) == 1:
+        return "raw", next(iter(raw_candidates))
+    return None
+
+
+def impact_graph_snapshot(
+    pages: dict[str, ImpactPage],
+    raw_paths: set[str],
+) -> tuple[
+    dict[tuple[str, str], set[str]],
+    dict[str, set[tuple[str, str]]],
+]:
+    page_paths = set(pages)
+    page_names: dict[str, set[str]] = {}
+    for page in pages.values():
+        page_names.setdefault(PurePosixPath(page.path).stem.casefold(), set()).add(page.path)
+        for alias in page.aliases:
+            page_names.setdefault(alias.casefold(), set()).add(page.path)
+    raw_names: dict[str, set[str]] = {}
+    for rel in raw_paths:
+        raw_names.setdefault(PurePosixPath(rel).name.casefold(), set()).add(rel)
+
+    edges: dict[tuple[str, str], set[str]] = {}
+    raw_roots: dict[str, set[tuple[str, str]]] = {}
+    for page in pages.values():
+        for value in page.sources:
+            target = link_target(value)
+            if not target.casefold().endswith(".md"):
+                target += ".md"
+            if target in page_paths:
+                edges.setdefault((target, page.path), set()).add("sources")
+        for value in page.raw:
+            target = link_target(value)
+            if target in raw_paths:
+                raw_roots.setdefault(page.path, set()).add((target, "declares_raw"))
+        for match in iter_prose_wikilinks(page.body):
+            resolved = resolve_impact_wikilink(
+                match.group(1),
+                page_paths=page_paths,
+                page_names=page_names,
+                raw_paths=raw_paths,
+                raw_names=raw_names,
+            )
+            if resolved is None:
+                continue
+            kind, target = resolved
+            if kind == "page":
+                edges.setdefault((target, page.path), set()).add("wikilink")
+            else:
+                raw_roots.setdefault(page.path, set()).add((target, "raw_link"))
+    return edges, raw_roots
+
+
+def strongly_connected_components(
+    nodes: set[str],
+    adjacency: dict[str, set[str]],
+) -> list[tuple[str, ...]]:
+    visited: set[str] = set()
+    order: list[str] = []
+    for start in sorted(nodes):
+        if start in visited:
+            continue
+        stack: list[tuple[str, bool]] = [(start, False)]
+        while stack:
+            node, expanded = stack.pop()
+            if expanded:
+                order.append(node)
+                continue
+            if node in visited:
+                continue
+            visited.add(node)
+            stack.append((node, True))
+            for successor in sorted(adjacency.get(node, set()), reverse=True):
+                if successor in nodes and successor not in visited:
+                    stack.append((successor, False))
+
+    reverse: dict[str, set[str]] = {node: set() for node in nodes}
+    for source, successors in adjacency.items():
+        if source not in nodes:
+            continue
+        for target in successors:
+            if target in nodes:
+                reverse[target].add(source)
+    assigned: set[str] = set()
+    components: list[tuple[str, ...]] = []
+    for start in reversed(order):
+        if start in assigned:
+            continue
+        component: set[str] = set()
+        stack = [start]
+        assigned.add(start)
+        while stack:
+            node = stack.pop()
+            component.add(node)
+            for predecessor in sorted(reverse.get(node, set()), reverse=True):
+                if predecessor not in assigned:
+                    assigned.add(predecessor)
+                    stack.append(predecessor)
+        components.append(tuple(sorted(component)))
+    return components
+
+
+def build_raw_impact(
+    before_raw: dict[str, str],
+    after_raw: dict[str, str],
+    before_pages: dict[str, ImpactPage],
+    after_pages: dict[str, ImpactPage],
+) -> dict[str, Any] | None:
+    changes: list[dict[str, Any]] = []
+    for rel in sorted(set(before_raw) | set(after_raw)):
+        before_oid = before_raw.get(rel)
+        after_oid = after_raw.get(rel)
+        if before_oid == after_oid:
+            continue
+        status = "added" if before_oid is None else "deleted" if after_oid is None else "modified"
+        changes.append(
+            {
+                "path": rel,
+                "status": status,
+                "before_path": rel if before_oid is not None else None,
+                "after_path": rel if after_oid is not None else None,
+                "before_oid": before_oid,
+                "after_oid": after_oid,
+            }
+        )
+    if not changes:
+        return None
+
+    before_edges, before_roots = impact_graph_snapshot(before_pages, set(before_raw))
+    after_edges, after_roots = impact_graph_snapshot(after_pages, set(after_raw))
+    pages = dict(before_pages)
+    pages.update(after_pages)
+    edges: dict[tuple[str, str], set[str]] = {}
+    for snapshot_edges in (before_edges, after_edges):
+        for edge, relations in snapshot_edges.items():
+            edges.setdefault(edge, set()).update(relations)
+    changed_raw = {item["path"] for item in changes}
+    root_reasons: dict[str, set[tuple[str, str]]] = {}
+    for snapshot_roots in (before_roots, after_roots):
+        for page, reasons in snapshot_roots.items():
+            for raw_rel, relation in reasons:
+                if raw_rel in changed_raw:
+                    root_reasons.setdefault(page, set()).add((raw_rel, relation))
+
+    adjacency: dict[str, set[str]] = {path: set() for path in pages}
+    reverse: dict[str, set[str]] = {path: set() for path in pages}
+    for source, target in edges:
+        if source in pages and target in pages:
+            adjacency[source].add(target)
+            reverse[target].add(source)
+    roots = set(root_reasons)
+    reachable: set[str] = set()
+    pending = sorted(roots, reverse=True)
+    while pending:
+        node = pending.pop()
+        if node in reachable:
+            continue
+        reachable.add(node)
+        pending.extend(sorted(adjacency.get(node, set()) - reachable, reverse=True))
+
+    components = strongly_connected_components(reachable, adjacency)
+    component_of = {
+        page: index
+        for index, component in enumerate(components)
+        for page in component
+    }
+    component_edges: dict[int, set[int]] = {index: set() for index in range(len(components))}
+    component_reverse: dict[int, set[int]] = {index: set() for index in range(len(components))}
+    for source, successors in adjacency.items():
+        if source not in reachable:
+            continue
+        for target in successors:
+            if target not in reachable:
+                continue
+            left, right = component_of[source], component_of[target]
+            if left != right:
+                component_edges[left].add(right)
+                component_reverse[right].add(left)
+
+    distances: dict[int, int] = {}
+    queue = sorted({component_of[root] for root in roots}, reverse=True)
+    for component in queue:
+        distances[component] = 1
+    while queue:
+        component = queue.pop()
+        next_distance = distances[component] + 1
+        for successor in sorted(component_edges[component], reverse=True):
+            if successor not in distances or next_distance < distances[successor]:
+                distances[successor] = next_distance
+                queue.append(successor)
+
+    ordered_components = sorted(
+        range(len(components)),
+        key=lambda item: (distances.get(item, sys.maxsize), components[item]),
+    )
+    group_ids = {component: f"g{number}" for number, component in enumerate(ordered_components, start=1)}
+    groups: list[dict[str, Any]] = []
+    for component in ordered_components:
+        group_pages = list(components[component])
+        cyclic = len(group_pages) > 1 or any(
+            page in adjacency.get(page, set()) for page in group_pages
+        )
+        groups.append(
+            {
+                "id": group_ids[component],
+                "distance": distances[component],
+                "pages": group_pages,
+                "predecessors": [group_ids[item] for item in sorted(component_reverse[component], key=lambda value: group_ids[value])],
+                "successors": [group_ids[item] for item in sorted(component_edges[component], key=lambda value: group_ids[value])],
+                "cyclic": cyclic,
+            }
+        )
+
+    page_rows = [
+        {
+            "path": path,
+            "kind": pages[path].kind,
+            "distance": distances[component_of[path]],
+            "group": group_ids[component_of[path]],
+            "predecessors": sorted(reverse.get(path, set()) & reachable),
+            "successors": sorted(adjacency.get(path, set()) & reachable),
+        }
+        for path in sorted(reachable, key=lambda item: (distances[component_of[item]], item))
+    ]
+    edge_rows = [
+        {
+            "from": source,
+            "to": target,
+            "relations": sorted(relations),
+        }
+        for (source, target), relations in sorted(edges.items())
+        if source in reachable and target in reachable
+    ]
+    root_rows = [
+        {"raw": raw_rel, "page": page, "relation": relation}
+        for page, reasons in sorted(root_reasons.items())
+        for raw_rel, relation in sorted(reasons)
+    ]
+    owner_sources = sorted(
+        {
+            page
+            for page, reasons in before_roots.items()
+            if pages.get(page) is not None
+            and pages[page].kind == "source"
+            and any(raw_rel in changed_raw and relation == "declares_raw" for raw_rel, relation in reasons)
+        }
+    )
+    layers = [
+        {
+            "distance": distance,
+            "groups": [item["id"] for item in groups if item["distance"] == distance],
+        }
+        for distance in sorted({item["distance"] for item in groups})
+    ]
+    return {
+        "changes": changes,
+        "owner_sources": owner_sources,
+        "roots": root_rows,
+        "pages": page_rows,
+        "edges": edge_rows,
+        "groups": groups,
+        "layers": layers,
+    }
+
+
+def raw_impact_between_revisions(
+    repository: Path,
+    base: str,
+    candidate: str,
+) -> dict[str, Any] | None:
+    before_raw = raw_snapshot_from_revision(repository, base)
+    after_raw = raw_snapshot_from_revision(repository, candidate)
+    if before_raw == after_raw:
+        return None
+    return build_raw_impact(
+        before_raw,
+        after_raw,
+        impact_pages_from_revision(repository, base),
+        impact_pages_from_revision(repository, candidate),
+    )
+
+
+def raw_impact_from_worktree(vault: Path, base: str) -> dict[str, Any] | None:
+    before_raw = raw_snapshot_from_revision(vault, base)
+    after_raw = raw_snapshot_from_worktree(vault)
+    if before_raw == after_raw:
+        return None
+    return build_raw_impact(
+        before_raw,
+        after_raw,
+        impact_pages_from_revision(vault, base),
+        impact_pages_from_worktree(vault),
+    )
 
 
 def repository_index_path(repository: Path) -> Path:
@@ -3895,24 +4297,58 @@ def update_candidate_index(
     run_git(repository, ["update-index", "--add", "--cacheinfo", mode, oid, rel])
 
 
-def candidate_raw_findings(
-    source: Path,
+def candidate_raw_review(
+    repository: Path,
     base: str,
-    candidate_repository: Path,
     candidate: str,
-) -> list[dict[str, Any]]:
-    base_entries = exact_tree_entries(source, base)
-    candidate_entries = exact_tree_entries(candidate_repository, candidate)
+    scope: set[str],
+    operation: str,
+    worktree_impact: dict[str, Any] | None,
+    worktree_dirty: set[str],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    impact = raw_impact_between_revisions(repository, base, candidate)
     findings: list[dict[str, Any]] = []
-    for rel, entry in sorted(base_entries.items()):
-        if not rel.startswith("raw/") or rel == "raw/.gitkeep":
-            continue
-        current = candidate_entries.get(rel)
-        if current is None:
-            findings.append(finding("E_RAW_IMMUTABLE", rel, "committed raw path was deleted or moved"))
-        elif current.oid != entry.oid or current.object_type != entry.object_type:
-            findings.append(finding("E_RAW_IMMUTABLE", rel, "committed raw bytes were modified"))
-    return findings
+    normalized = operation.strip().casefold().replace("_", "-")
+    if normalized == "raw-update" and worktree_impact is not None:
+        missing_raw = sorted(
+            {item["path"] for item in worktree_impact["changes"]} - scope
+        )
+        impacted_pages = {item["path"] for item in worktree_impact["pages"]}
+        missing_pages = sorted((worktree_dirty & impacted_pages) - scope)
+        for rel in [*missing_raw, *missing_pages]:
+            findings.append(
+                finding(
+                    "E_RAW_REVIEW_SCOPE",
+                    rel,
+                    "raw-update must include every changed raw and every changed page in its impact graph",
+                )
+            )
+    if impact is None:
+        return (worktree_impact if findings else None), findings
+    existing_changes = [
+        item
+        for item in impact["changes"]
+        if item["status"] in {"modified", "deleted"}
+    ]
+    if existing_changes and normalized != "raw-update":
+        findings.append(
+            finding(
+                "E_RAW_OPERATION",
+                existing_changes[0]["path"],
+                "modifying or deleting committed raw requires operation raw-update",
+            )
+        )
+    if existing_changes:
+        missing_sources = sorted(set(impact["owner_sources"]) - scope)
+        if missing_sources:
+            findings.append(
+                finding(
+                    "E_RAW_REVIEW_SCOPE",
+                    missing_sources[0],
+                    "raw-update must explicitly include every original owner source for review",
+                )
+            )
+    return impact, findings
 
 
 def candidate_tag_policy_findings(
@@ -4093,6 +4529,8 @@ def build_candidate_checkpoint(
     scope: set[str],
     operation: str,
     temporary_root: Path,
+    worktree_impact: dict[str, Any] | None,
+    worktree_dirty: set[str],
 ) -> CandidateCheckpoint:
     repository = temporary_root / "candidate"
     disabled_hooks = temporary_root / "disabled-hooks"
@@ -4152,7 +4590,16 @@ def build_candidate_checkpoint(
     source_git_dir = Path(run_git(vault, ["rev-parse", "--absolute-git-dir"]).stdout.strip())
     changes = exact_tree_changes(repository, base, commit)
     findings = audit_findings(repository, attributes_git_dir=source_git_dir)
-    findings.extend(candidate_raw_findings(vault, base, repository, commit))
+    raw_impact, raw_findings = candidate_raw_review(
+        repository,
+        base,
+        commit,
+        scope,
+        operation,
+        worktree_impact,
+        worktree_dirty,
+    )
+    findings.extend(raw_findings)
     findings.extend(candidate_tag_policy_findings(vault, base, repository, commit))
     findings.extend(
         candidate_tag_operation_findings(repository, base, commit, operation, changes)
@@ -4176,6 +4623,7 @@ def build_candidate_checkpoint(
         git_index_bytes=repository_index_path(repository).read_bytes(),
         findings=tuple(findings),
         diff=diff,
+        raw_impact=raw_impact,
     )
 
 
@@ -4304,6 +4752,7 @@ def _command_save_with_hooks_disabled(args: argparse.Namespace) -> int:
     if not requested:
         raise WikiError("save requires at least one explicit --include path.")
     scope = expand_include_scope(vault, requested, dirty)
+    worktree_impact = raw_impact_from_worktree(vault, base)
     with tempfile.TemporaryDirectory(prefix="llm-wiki-save-") as temporary:
         checkpoint = build_candidate_checkpoint(
             vault,
@@ -4311,6 +4760,8 @@ def _command_save_with_hooks_disabled(args: argparse.Namespace) -> int:
             scope,
             operation,
             Path(temporary),
+            worktree_impact,
+            dirty,
         )
         if checkpoint.findings:
             emit(
@@ -4323,6 +4774,7 @@ def _command_save_with_hooks_disabled(args: argparse.Namespace) -> int:
                     "review_required": False,
                     "index_changed": checkpoint.index_changed,
                     "findings": list(checkpoint.findings),
+                    "raw_impact": checkpoint.raw_impact,
                     "next": "Correct the findings; the visible pending changes were preserved.",
                 }
             )
@@ -4340,6 +4792,7 @@ def _command_save_with_hooks_disabled(args: argparse.Namespace) -> int:
                     "risks": list(checkpoint.risks),
                     "changes": list(checkpoint.changes),
                     "diff": checkpoint.diff,
+                    "raw_impact": checkpoint.raw_impact,
                     "next": "Review the diff, then repeat save with --approved if it matches the user's intent.",
                 }
             )
@@ -4364,6 +4817,7 @@ def _command_save_with_hooks_disabled(args: argparse.Namespace) -> int:
                     "commit": base,
                     "changes": [],
                     "index_changed": checkpoint.index_changed,
+                    "raw_impact": checkpoint.raw_impact,
                     "next": "No checkpoint was needed because the selected candidate already matches HEAD.",
                 }
             )
@@ -4389,6 +4843,7 @@ def _command_save_with_hooks_disabled(args: argparse.Namespace) -> int:
                 "commit": checkpoint.commit,
                 "changes": list(checkpoint.changes),
                 "index_changed": checkpoint.index_changed,
+                "raw_impact": checkpoint.raw_impact,
                 "clean": not dirty_path_sets(vault)[0],
             }
         )
@@ -4428,14 +4883,14 @@ def build_parser() -> argparse.ArgumentParser:
     begin = subparsers.add_parser(
         "begin",
         help="Inspect HEAD and pending work without writing.",
-        description="Inspect the current Git HEAD and visible changes, then return the base OID for a write workflow.",
+        description="Inspect the current Git HEAD and visible changes, return the base OID, and report a layered impact graph when raw evidence changed.",
     )
     begin.set_defaults(func=command_begin)
 
     add = subparsers.add_parser(
         "add",
         help="Copy raw inputs and create a pending source skeleton.",
-        description="Copy input files into immutable raw storage and create or extend a source-page draft.",
+        description="Copy input files into Git-versioned raw storage and create or extend a source-page draft.",
     )
     add.add_argument("inputs", nargs="+", help="Source material files to copy byte-for-byte into raw/.")
     add.add_argument("--base", required=True, help="Git commit OID returned by the most recent begin command.")
@@ -4578,7 +5033,7 @@ def build_parser() -> argparse.ArgumentParser:
     save.add_argument(
         "--operation",
         required=True,
-        help="Short semantic label used for risk detection and the Git checkpoint message.",
+        help="Short semantic label used for risk detection and the Git checkpoint message; use raw-update for committed raw changes.",
     )
     save.add_argument(
         "--include",

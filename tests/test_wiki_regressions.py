@@ -784,6 +784,266 @@ class TagPolicyRegressionTests(WikiCliTestCase):
 
 
 class RawVersionRegressionTests(WikiCliTestCase):
+    def test_raw_impact_graph_uses_union_edges_shortest_distance_and_cycle_groups(self) -> None:
+        runtime = load_wiki_runtime()
+        impact_page = runtime.ImpactPage
+        build_raw_impact = runtime.build_raw_impact
+
+        pages = {
+            "sources/A.md": impact_page(
+                "sources/A.md", "source", (), (), ("[[raw/evidence.pdf]]",), ""
+            ),
+            "notes/Direct.md": impact_page(
+                "notes/Direct.md", "note", (), (), (), "参见 [[raw/evidence.pdf]]。"
+            ),
+            "notes/B.md": impact_page(
+                "notes/B.md", "note", (), ("[[sources/A]]",), (), ""
+            ),
+            "notes/C.md": impact_page(
+                "notes/C.md", "note", (), ("[[sources/A]]", "[[notes/B]]"), (), ""
+            ),
+            "notes/D.md": impact_page(
+                "notes/D.md", "note", (), ("[[notes/C]]",), (), ""
+            ),
+            "notes/E.md": impact_page(
+                "notes/E.md", "note", (), ("[[notes/D]]", "[[notes/F]]"), (), ""
+            ),
+            "notes/F.md": impact_page(
+                "notes/F.md", "note", (), ("[[notes/E]]",), (), ""
+            ),
+        }
+        after_pages = dict(pages)
+        after_pages["notes/B.md"] = impact_page("notes/B.md", "note", (), (), (), "")
+
+        impact = build_raw_impact(
+            {"raw/evidence.pdf": "old-oid"},
+            {"raw/evidence.pdf": "new-oid"},
+            pages,
+            after_pages,
+        )
+        self.assertIsNotNone(impact)
+        assert impact is not None
+        self.assertEqual(
+            impact["changes"],
+            [
+                {
+                    "path": "raw/evidence.pdf",
+                    "status": "modified",
+                    "before_path": "raw/evidence.pdf",
+                    "after_path": "raw/evidence.pdf",
+                    "before_oid": "old-oid",
+                    "after_oid": "new-oid",
+                }
+            ],
+        )
+        self.assertEqual(impact["owner_sources"], ["sources/A.md"])
+        self.assertEqual(
+            [layer["distance"] for layer in impact["layers"]],
+            [1, 2, 3, 4],
+        )
+        page_rows = {row["path"]: row for row in impact["pages"]}
+        self.assertEqual(page_rows["sources/A.md"]["distance"], 1)
+        self.assertEqual(page_rows["notes/Direct.md"]["distance"], 1)
+        self.assertEqual(page_rows["notes/B.md"]["distance"], 2)
+        self.assertEqual(page_rows["notes/C.md"]["distance"], 2)
+        self.assertEqual(
+            page_rows["notes/C.md"]["predecessors"],
+            ["notes/B.md", "sources/A.md"],
+        )
+        self.assertEqual(page_rows["notes/E.md"]["distance"], 4)
+        self.assertEqual(page_rows["notes/E.md"]["group"], page_rows["notes/F.md"]["group"])
+        cycle = next(
+            group for group in impact["groups"] if group["id"] == page_rows["notes/E.md"]["group"]
+        )
+        self.assertIs(cycle["cyclic"], True)
+        self.assertEqual(cycle["pages"], ["notes/E.md", "notes/F.md"])
+        self.assertEqual(
+            impact,
+            build_raw_impact(
+                {"raw/evidence.pdf": "old-oid"},
+                {"raw/evidence.pdf": "new-oid"},
+                pages,
+                after_pages,
+            ),
+        )
+
+    def test_raw_rename_and_delete_keep_base_dependencies_in_the_impact_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vault = self.init_vault(root)
+            material = root / "证据.pdf"
+            material.write_bytes(b"%PDF-1.7\x00versioned-evidence\xff")
+            base = git_head(vault)
+            added = self.assert_exit(
+                run_cli("add", str(material), "--base", base, "--name", "版本证据", cwd=vault),
+                0,
+            )
+            source_rel = str(added["source"])
+            old_raw_rel = str(added["raw"][0]["path"])  # type: ignore[index]
+            set_frontmatter_scalar(vault / source_rel, "summary", "版本化证据的来源卡片。")
+            note_rel = "notes/证据综合.md"
+            write_page(
+                vault,
+                note_rel,
+                "证据综合",
+                "note",
+                summary="依赖版本化来源的综合。",
+                aliases=[],
+                tags=[],
+                sources=[f"[[{source_rel.removesuffix('.md')}]]"],
+            )
+            self.save(
+                vault,
+                base,
+                operation="ingest",
+                include=[source_rel, old_raw_rel, note_rel],
+            )
+
+            rename_base = git_head(vault)
+            new_raw_rel = "raw/版本证据/证据-批注版.pdf"
+            (vault / old_raw_rel).rename(vault / new_raw_rel)
+            source = vault / source_rel
+            source.write_text(
+                source.read_text(encoding="utf-8").replace(old_raw_rel, new_raw_rel),
+                encoding="utf-8",
+                newline="\n",
+            )
+            begun = self.assert_exit(run_cli("begin", cwd=vault), 0)
+            impact = begun.get("raw_impact")
+            self.assertIsInstance(impact, dict, begun)
+            assert isinstance(impact, dict)
+            self.assertEqual(
+                {(item["path"], item["status"]) for item in impact["changes"]},
+                {(old_raw_rel, "deleted"), (new_raw_rel, "added")},
+            )
+            self.assertEqual(impact["owner_sources"], [source_rel])
+            page_rows = {row["path"]: row for row in impact["pages"]}
+            self.assertEqual(page_rows[source_rel]["distance"], 1)
+            self.assertEqual(page_rows[note_rel]["distance"], 2)
+
+            preview = self.save(
+                vault,
+                rename_base,
+                operation="raw-update",
+                include=[old_raw_rel, new_raw_rel, source_rel],
+                expected=5,
+            )
+            self.assertEqual(preview.get("raw_impact"), impact)
+            self.save(
+                vault,
+                rename_base,
+                operation="raw-update",
+                include=[old_raw_rel, new_raw_rel, source_rel],
+                approved=True,
+            )
+            self.assertFalse((vault / old_raw_rel).exists())
+            self.assertTrue((vault / new_raw_rel).is_file())
+            self.assertEqual(git_show_bytes(vault, f"HEAD^:{old_raw_rel}"), material.read_bytes())
+            self.assertEqual(git_show_bytes(vault, f"HEAD:{new_raw_rel}"), material.read_bytes())
+            self.assertEqual(git_status(vault), [])
+
+            delete_base = git_head(vault)
+            (vault / new_raw_rel).unlink()
+            rejected = self.save(
+                vault,
+                delete_base,
+                operation="raw-update",
+                include=[new_raw_rel, source_rel],
+                approved=True,
+                expected=4,
+            )
+            self.assertIn("E_RAW_REF", finding_codes(rejected))
+            delete_impact = rejected.get("raw_impact")
+            self.assertIsInstance(delete_impact, dict, rejected)
+            assert isinstance(delete_impact, dict)
+            self.assertEqual(delete_impact["owner_sources"], [source_rel])
+            self.assertIn(note_rel, {row["path"] for row in delete_impact["pages"]})
+            self.assertEqual(git_head(vault), delete_base)
+
+            source.write_text(
+                source.read_text(encoding="utf-8").replace(
+                    f'raw: ["[[{new_raw_rel}]]"]',
+                    "raw: []",
+                ),
+                encoding="utf-8",
+                newline="\n",
+            )
+            delete_preview = self.save(
+                vault,
+                delete_base,
+                operation="raw-update",
+                include=[new_raw_rel, source_rel],
+                expected=5,
+            )
+            self.assertEqual(
+                [(item["path"], item["status"]) for item in delete_preview["raw_impact"]["changes"]],
+                [(new_raw_rel, "deleted")],
+            )
+            self.save(
+                vault,
+                delete_base,
+                operation="raw-update",
+                include=[new_raw_rel, source_rel],
+                approved=True,
+            )
+            self.assertFalse((vault / new_raw_rel).exists())
+            self.assertEqual(git_show_bytes(vault, f"HEAD^:{new_raw_rel}"), material.read_bytes())
+            self.assert_exit(run_cli("audit", "--scope", "all", cwd=vault), 0)
+
+    def test_raw_update_requires_every_changed_impacted_page_in_the_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vault = self.init_vault(root)
+            material = root / "scope.pdf"
+            material.write_bytes(b"%PDF-1.7\x00scope-v1\xff")
+            base = git_head(vault)
+            added = self.assert_exit(
+                run_cli("add", str(material), "--base", base, "--name", "范围来源", cwd=vault),
+                0,
+            )
+            source_rel = str(added["source"])
+            raw_rel = str(added["raw"][0]["path"])  # type: ignore[index]
+            set_frontmatter_scalar(vault / source_rel, "summary", "用于验证影响范围的来源。")
+            note_rel = "notes/范围下游.md"
+            note = write_page(
+                vault,
+                note_rel,
+                "范围下游",
+                "note",
+                summary="依赖范围来源的下游页面。",
+                aliases=[],
+                tags=[],
+                sources=[f"[[{source_rel.removesuffix('.md')}]]"],
+            )
+            self.save(vault, base, operation="ingest", include=[source_rel, raw_rel, note_rel])
+
+            update_base = git_head(vault)
+            (vault / raw_rel).write_bytes(b"%PDF-1.7\x00scope-v2\xfe")
+            with note.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write("受新证据影响的补充判断。\n")
+            rejected = self.save(
+                vault,
+                update_base,
+                operation="raw-update",
+                include=[raw_rel, source_rel],
+                expected=4,
+            )
+            self.assertIn("E_RAW_REVIEW_SCOPE", finding_codes(rejected))
+            self.assertIn(note_rel, findings_text(rejected))
+            self.assertEqual(git_head(vault), update_base)
+
+            preview = self.save(
+                vault,
+                update_base,
+                operation="raw-update",
+                include=[raw_rel, source_rel, note_rel],
+                expected=5,
+            )
+            self.assertEqual(
+                set(preview.get("changes", [])),
+                {raw_rel, note_rel},
+            )
+
     def test_old_raw_attribute_rule_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             vault = self.init_vault(Path(temp_dir))
@@ -1079,7 +1339,6 @@ class RawPathRegressionTests(WikiCliTestCase):
 
             audit = self.assert_exit(run_cli("audit", "--scope", "all", cwd=vault), 4)
             self.assertIn("E_PATH_UNSAFE", finding_codes(audit))
-            self.assertIn("E_RAW_IMMUTABLE", finding_codes(audit))
             report = findings_text(audit)
             for rel in controls:
                 self.assertIn(rel.lower(), report)

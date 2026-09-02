@@ -2018,7 +2018,7 @@ class RawIngestTests(WikiCliTestCase):
             self.assertEqual(git_head(vault), committed_head)
             self.assertEqual(git_status(vault), [])
 
-    def test_modified_committed_raw_blocks_save_without_restoring_or_committing(self) -> None:
+    def test_modified_committed_raw_requires_review_and_versions_the_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             vault, _material, base, _payload_text = self.add_binary_source(root)
@@ -2028,23 +2028,85 @@ class RawIngestTests(WikiCliTestCase):
             self.save(vault, base, operation="ingest", include=[source_rel, raw_rel])
             committed_head = git_head(vault)
             original_commit_bytes = git_show_bytes(vault, f"HEAD:{raw_rel}")
-            changed = b"changed raw bytes that must remain visible"
+            source_before = (vault / source_rel).read_bytes()
+            changed = b"changed raw bytes retained as a new Git version"
             (vault / raw_rel).write_bytes(changed)
 
-            audit = self.assert_exit(run_cli("audit", "--scope", "changed", cwd=vault), 4)
-            self.assertIn("raw", json.dumps(audit, ensure_ascii=False).lower())
-            saved = self.save(
+            audit = self.assert_exit(run_cli("audit", "--scope", "changed", cwd=vault), 0)
+            self.assertIs(audit.get("valid"), True, audit)
+            begin_before = snapshot_files(vault)
+            status_before = git_status(vault)
+            begun = self.assert_exit(run_cli("begin", cwd=vault), 0)
+            impact = begun.get("raw_impact")
+            self.assertIsInstance(impact, dict, begun)
+            assert isinstance(impact, dict)
+            self.assertEqual(
+                impact.get("changes"),
+                [
+                    {
+                        "path": raw_rel,
+                        "status": "modified",
+                        "before_path": raw_rel,
+                        "after_path": raw_rel,
+                        "before_oid": run_git(vault, "rev-parse", f"HEAD:{raw_rel}").stdout.strip(),
+                        "after_oid": run_git(vault, "hash-object", "--no-filters", "--", raw_rel).stdout.strip(),
+                    }
+                ],
+            )
+            self.assertEqual(impact.get("owner_sources"), [source_rel])
+            self.assertEqual(impact.get("layers"), [{"distance": 1, "groups": ["g1"]}])
+            self.assertEqual(snapshot_files(vault), begin_before)
+            self.assertEqual(git_status(vault), status_before)
+
+            wrong_operation = self.save(
                 vault,
                 committed_head,
                 operation="edit",
+                include=[raw_rel, source_rel],
+                expected=4,
+            )
+            self.assertIn(
+                "E_RAW_OPERATION",
+                {item["code"] for item in wrong_operation.get("findings", [])},
+            )
+            missing_owner = self.save(
+                vault,
+                committed_head,
+                operation="raw-update",
                 include=[raw_rel],
                 expected=4,
             )
-            self.assertIs(saved.get("saved"), False, saved)
+            self.assertIn(
+                "E_RAW_REVIEW_SCOPE",
+                {item["code"] for item in missing_owner.get("findings", [])},
+            )
+            preview = self.save(
+                vault,
+                committed_head,
+                operation="raw-update",
+                include=[raw_rel, source_rel],
+                expected=5,
+            )
+            self.assertIs(preview.get("review_required"), True, preview)
+            self.assertEqual(preview.get("raw_impact"), impact)
             self.assertEqual((vault / raw_rel).read_bytes(), changed)
             self.assertEqual(git_show_bytes(vault, f"HEAD:{raw_rel}"), original_commit_bytes)
             self.assertEqual(git_head(vault), committed_head)
-            self.assertTrue(git_status(vault))
+            self.assertEqual((vault / source_rel).read_bytes(), source_before)
+
+            saved = self.save(
+                vault,
+                committed_head,
+                operation="raw-update",
+                include=[raw_rel, source_rel],
+                approved=True,
+            )
+            self.assertIs(saved.get("saved"), True, saved)
+            self.assertEqual(saved.get("raw_impact"), impact)
+            self.assertEqual(git_show_bytes(vault, f"HEAD:{raw_rel}"), changed)
+            self.assertEqual(git_show_bytes(vault, f"HEAD^:{raw_rel}"), original_commit_bytes)
+            self.assertEqual((vault / source_rel).read_bytes(), source_before)
+            self.assertEqual(git_status(vault), [])
 
 
 class GitWorkflowTests(WikiCliTestCase):

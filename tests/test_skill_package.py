@@ -369,6 +369,34 @@ class SkillPackageAcceptanceTests(unittest.TestCase):
         self.assertIn("tags vocabulary", agents)
         self.assertIn("tags check", agents)
 
+    def test_versioned_raw_updates_route_to_layered_review(self) -> None:
+        skill = SKILL_PATH.read_text(encoding="utf-8")
+        contract = (SKILL_DIR / "references" / "contract.md").read_text(encoding="utf-8")
+        ingest = (SKILL_DIR / "references" / "ingest.md").read_text(encoding="utf-8")
+        maintain = (SKILL_DIR / "references" / "maintain.md").read_text(encoding="utf-8")
+        agents = (SKILL_DIR / "templates" / "AGENTS-for-wiki.md").read_text(encoding="utf-8")
+        design = (REPO_ROOT / "docs" / "design-spec.md").read_text(encoding="utf-8")
+
+        self.assertIn("Git 版本化证据", skill)
+        self.assertRegex(skill, r"raw 版本更新[^\n]*\[维护\]\(references/maintain\.md\)")
+        for text in (contract, ingest, maintain, agents, design):
+            self.assertIn("raw-update", text)
+        for decision in ("none", "link-only", "update", "rewrite", "delete"):
+            self.assertIn(f"`{decision}`", maintain)
+        for boundary in ("只打开第 1 层", "不得预先读取完整候选", "全部前驱停止"):
+            self.assertIn(boundary, maintain)
+        self.assertIn("owner source 即使无需修改", maintain)
+        self.assertIn("旧路径删除与新路径新增", maintain)
+        for routed_text in (skill, contract, agents):
+            for workflow_detail in ("`none`", "`link-only`", "全部前驱停止", "owner source 即使无需修改"):
+                self.assertNotIn(workflow_detail, routed_text)
+        self.assertIn("已安装技能的 `raw-update` 维护流程", agents)
+        repo_agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        for invariant in ("raw-update", "显式范围", "审计", "批准"):
+            self.assertIn(invariant, repo_agents)
+        self.assertNotIn("逐层影响审核", repo_agents)
+        self.assertNotIn("E_RAW_IMMUTABLE", SCRIPT_PATH.read_text(encoding="utf-8"))
+
     def test_ingest_keeps_a_linked_material_bundle_in_one_source(self) -> None:
         ingest = (SKILL_DIR / "references" / "ingest.md").read_text(encoding="utf-8")
         for phrase in (
@@ -411,7 +439,7 @@ class SkillPackageAcceptanceTests(unittest.TestCase):
     def test_each_public_command_has_substantive_help(self) -> None:
         expectations = {
             "init": (("create", "checkpoint"), ("vault", "--name", "--home-summary")),
-            "begin": (("inspect", "head", "base"), ()),
+            "begin": (("inspect", "head", "base", "impact"), ()),
             "add": (
                 ("raw", "source"),
                 ("inputs", "--base", "--name", "--identifier", "--parent", "--raw-dir"),
@@ -419,7 +447,7 @@ class SkillPackageAcceptanceTests(unittest.TestCase):
             "context": (("query", "index.csv"), ("--plan",)),
             "audit": (("read-only", "health", "structure"), ("--scope", "--format")),
             "save": (
-                ("rebuild", "index.csv", "audit", "checkpoint"),
+                ("rebuild", "index.csv", "audit", "checkpoint", "raw-update"),
                 ("--base", "--operation", "--include", "--approved"),
             ),
         }
